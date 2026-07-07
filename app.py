@@ -30,20 +30,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ========================= SESSION STATE =========================
-if "session_id" not in st.session_state:
-    st.session_state.session_id = f"session_{uuid.uuid4().hex[:8]}"
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "pdf_processed" not in st.session_state:
-    st.session_state.pdf_processed = False
-if "bm25_encoder" not in st.session_state:
-    st.session_state.bm25_encoder = None
-if "pinecone_index" not in st.session_state:
-    st.session_state.pinecone_index = None
-if "groq_key" not in st.session_state:
-    st.session_state.groq_key = ""
-if "pinecone_key" not in st.session_state:
-    st.session_state.pinecone_key = ""
+defaults = {
+    "session_id": f"session_{uuid.uuid4().hex[:8]}",
+    "chat_history": [],
+    "pdf_processed": False,
+    "bm25_encoder": None,
+    "pinecone_index": None,
+    "groq_key": "",
+    "pinecone_key": "",
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ========================= CACHED RESOURCES =========================
 @st.cache_resource
@@ -130,12 +128,11 @@ Text: {text}"""
         return "KNOWLEDGE GRAPH:\n" + "\n".join(list(set(relations))[:12]) if relations else ""
 
 
-# Initialize Semantic Cache (do this safely, after faiss import is confirmed)
 if "semantic_cache" not in st.session_state:
     st.session_state.semantic_cache = SemanticCache(embeddings)
 
 # ========================= HELPER: WAIT FOR PINECONE INDEX =========================
-def wait_for_index_ready(pc, index_name, timeout=60):
+def wait_for_index_ready(pc, index_name, timeout=90):
     start = time.time()
     while True:
         desc = pc.describe_index(index_name)
@@ -146,7 +143,6 @@ def wait_for_index_ready(pc, index_name, timeout=60):
         if time.time() - start > timeout:
             raise TimeoutError(f"Pinecone index '{index_name}' did not become ready in time.")
         time.sleep(1)
-
 
 # ========================= SIDEBAR =========================
 with st.sidebar:
@@ -169,12 +165,10 @@ with st.sidebar:
         tmp_path = None
         try:
             with st.spinner("Processing PDF + Building Hybrid Index..."):
-                # Save uploaded file temporarily
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.getvalue())
                     tmp_path = tmp.name
 
-                # Load & split PDF
                 loader = PyPDFLoader(tmp_path)
                 docs = loader.load()
                 if not docs:
@@ -187,20 +181,18 @@ with st.sidebar:
 
                 texts = [chunk.page_content for chunk in chunks]
 
-                # BM25
                 st.write("🔧 Fitting BM25 encoder...")
                 bm25 = BM25Encoder().default()
                 bm25.fit(texts)
                 st.session_state.bm25_encoder = bm25
 
-                # Pinecone setup
                 st.write("🔧 Connecting to Pinecone...")
                 pc = Pinecone(api_key=st.session_state.pinecone_key)
                 index_name = "graphrag"
 
                 existing_indexes = [idx.name for idx in pc.list_indexes()]
                 if index_name not in existing_indexes:
-                    st.write("🔧 Creating new Pinecone index (this may take up to a minute)...")
+                    st.write("🔧 Creating new Pinecone index (may take up to a minute)...")
                     pc.create_index(
                         name=index_name,
                         dimension=384,
@@ -209,13 +201,11 @@ with st.sidebar:
                     )
                     wait_for_index_ready(pc, index_name, timeout=90)
                 else:
-                    # Even if it exists, make sure it's ready
                     wait_for_index_ready(pc, index_name, timeout=30)
 
                 index = pc.Index(index_name)
                 st.session_state.pinecone_index = index
 
-                # Build & upsert vectors
                 st.write("🔧 Embedding & upserting chunks into Pinecone...")
                 vectors = []
                 for i, (text, chunk) in enumerate(zip(texts, chunks)):
@@ -232,7 +222,6 @@ with st.sidebar:
                         }
                     })
 
-                # Upsert in batches to avoid payload size limits
                 batch_size = 100
                 for start_idx in range(0, len(vectors), batch_size):
                     batch = vectors[start_idx:start_idx + batch_size]
@@ -270,77 +259,68 @@ st.caption("HyDE + Hybrid Search + Cross-Encoder Reranking + Knowledge Graph + S
 
 if not st.session_state.pdf_processed:
     st.info("👈 Please add your API keys and upload a PDF in the sidebar, then click **Process Document** to start chatting.")
-else:
-    # Guard against missing resources (e.g. after partial state issues)
-    if not st.session_state.bm25_encoder or not st.session_state.pinecone_index or not st.session_state.groq_key:
-        st.error("Some required resources are missing. Please reprocess the document.")
-        st.stop()
+    st.stop()
 
-    llm = ChatGroq(model_name="llama-3.1-8b-instant", api_key=st.session_state.groq_key)
-    kg_rag = KnowledgeGraphRAG(llm)
+# ---- IMPORTANT: Render chat history + chat_input FIRST, before any risky setup ----
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-    # Retriever
-    retriever = PineconeHybridSearchRetriever(
-        embeddings=embeddings,
-        sparse_encoder=st.session_state.bm25_encoder,
-        index=st.session_state.pinecone_index,
-        alpha=0.5,
-        top_k=8,
-        namespace=st.session_state.session_id
-    )
+query = st.chat_input("Ask any question about your document...")
 
-    # Display Chat History
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+if query:
+    st.session_state.chat_history.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(query)
 
-    query = st.chat_input("Ask any question about your document...")
+    with st.chat_message("assistant"):
+        cache_hit = False
+        similarity = 0.0
+        hypothetical_doc = ""
+        graph_context = ""
+        final_context = ""
+        response = ""
 
-    if query:
-        st.session_state.chat_history.append({"role": "user", "content": query})
-        with st.chat_message("user"):
-            st.markdown(query)
+        try:
+            # ---- Build heavy objects only now, when actually needed ----
+            if not st.session_state.bm25_encoder or not st.session_state.pinecone_index:
+                st.error("Required resources missing. Please reprocess the document.")
+                st.stop()
 
-        with st.chat_message("assistant"):
-            cache_hit = False
-            hypothetical_doc = ""
-            graph_context = ""
-            final_context = ""
-            response = ""
+            llm = ChatGroq(model=st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant"),
+                            api_key=st.session_state.groq_key)
+
+            retriever = PineconeHybridSearchRetriever(
+                embeddings=embeddings,
+                sparse_encoder=st.session_state.bm25_encoder,
+                index=st.session_state.pinecone_index,
+                alpha=0.5,
+                top_k=8,
+                namespace=st.session_state.session_id
+            )
+
+            kg_rag = KnowledgeGraphRAG(llm)
 
             with st.status("Thinking...", expanded=True) as status:
-                # Check Cache
+                # Check cache
                 try:
                     cache_result = st.session_state.semantic_cache.get_cached_answer(query)
                 except Exception:
                     cache_result = None
 
                 if cache_result:
-                    answer, similarity = cache_result
+                    response, similarity = cache_result
                     cache_hit = True
                     status.update(label="Answered from Cache", state="complete")
-                    response = answer
                 else:
-                    # HyDE
                     status.write("Generating Hypothetical Document (HyDE)...")
-                    try:
-                        hyde_prompt = f"""Write a detailed, factual, encyclopedic passage that would answer this question:
+                    hyde_prompt = f"""Write a detailed, factual, encyclopedic passage that would answer this question:
 Question: {query}
 Passage:"""
-                        hypothetical_doc = llm.invoke(hyde_prompt).content
-                    except Exception as e:
-                        status.update(label="HyDE generation failed", state="error")
-                        st.error(f"Error generating HyDE passage: {e}")
-                        st.stop()
+                    hypothetical_doc = llm.invoke(hyde_prompt).content
 
-                    # Retrieve & Rerank
                     status.write("Retrieving & Reranking documents...")
-                    try:
-                        retrieved = retriever.invoke(hypothetical_doc)
-                    except Exception as e:
-                        status.update(label="Retrieval failed", state="error")
-                        st.error(f"Error retrieving documents: {e}")
-                        st.stop()
+                    retrieved = retriever.invoke(hypothetical_doc)
 
                     if not retrieved:
                         status.update(label="No documents found", state="error")
@@ -352,12 +332,10 @@ Passage:"""
                     ranked = sorted(zip(scores, retrieved), key=lambda x: x[0], reverse=True)
                     top_docs = [doc for _, doc in ranked[:5]]
 
-                    # Knowledge Graph
                     status.write("Building Knowledge Graph...")
                     kg_rag.build_graph(top_docs)
                     graph_context = kg_rag.get_graph_context(query)
 
-                    # Construct final context
                     context_parts = [f"[Page {doc.metadata.get('page', '?')}] {doc.page_content}" for doc in top_docs]
                     final_context = "\n\n---\n\n".join(context_parts)
                     if graph_context:
@@ -365,7 +343,6 @@ Passage:"""
 
                     status.update(label="Generating Final Answer...", state="running")
 
-                    # Final Answer Generation
                     final_prompt = f"""You are an expert assistant. Answer the question **only** using the provided context and knowledge graph.
 If you cannot answer properly, say so.
 
@@ -375,18 +352,10 @@ Context:
 {final_context}
 
 Answer:"""
-
-                    try:
-                        response = llm.invoke(final_prompt).content
-                    except Exception as e:
-                        status.update(label="Answer generation failed", state="error")
-                        st.error(f"Error generating final answer: {e}")
-                        st.stop()
-
+                    response = llm.invoke(final_prompt).content
                     st.session_state.semantic_cache.add_to_cache(query, response)
                     status.update(label="Done", state="complete")
 
-            # Display badge if cache hit
             if cache_hit:
                 st.markdown(
                     f"<span class='badge cache-hit'>⚡ CACHE HIT ({similarity:.3f})</span>",
@@ -402,3 +371,8 @@ Answer:"""
                     tab1.write(hypothetical_doc)
                     tab2.code(graph_context if graph_context else "No clear relationships extracted.")
                     tab3.write(final_context)
+
+        except Exception as e:
+            st.error(f"Error generating answer: {str(e)}")
+            with st.expander("Full traceback (for debugging)"):
+                st.code(traceback.format_exc())
