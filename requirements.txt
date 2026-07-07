@@ -1,0 +1,12 @@
+streamlit
+langchain-core
+langchain-groq
+langchain-huggingface
+langchain-community
+sentence-transformers
+pinecone-client>=5.0.0
+pinecone-text
+faiss-cpu
+pypdf
+networkx
+numpy
