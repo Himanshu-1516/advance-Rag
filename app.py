@@ -1,10 +1,11 @@
+
 import streamlit as st
 import os
 import tempfile
 import uuid
 import numpy as np
 import networkx as nx
-import faiss  # <-- ADD THIS, missing import causing future crash
+import faiss  # <-- FIXED: Added missing faiss import
 from sentence_transformers import CrossEncoder
 
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -51,7 +52,7 @@ def load_reranker():
 embeddings = load_embeddings()
 reranker = load_reranker()
 
-# ========================= CLASSES (Exact from your notebook) =========================
+# ========================= CLASSES =========================
 class SemanticCache:
     def __init__(self, embeddings_model, threshold=0.82):
         self.embeddings = embeddings_model
@@ -190,7 +191,7 @@ with st.sidebar:
                 index.upsert(vectors=vectors, namespace=st.session_state.session_id)
                 st.session_state.pdf_processed = True
                 os.unlink(tmp_path)
-                st.success("✅ Document successfully processed!")
+                st.success("✅ Document successfully processed! You can now start chatting.")
             except Exception as e:
                 st.error(f"Error: {str(e)}")
 
@@ -204,7 +205,7 @@ st.markdown('<p class="main-header">🧠 Advanced Graph RAG System</p>', unsafe_
 st.caption("HyDE + Hybrid Search + Cross-Encoder Reranking + Knowledge Graph + Semantic Cache")
 
 if not st.session_state.pdf_processed:
-    st.info("👈 Please add your API keys and upload a PDF in the sidebar to start.")
+    st.info("👈 Please add your API keys and upload a PDF in the sidebar, then click 'Process Document' to start chatting.")
 else:
     llm = ChatGroq(model_name="llama-3.1-8b-instant", api_key=st.session_state.groq_key)
     kg_rag = KnowledgeGraphRAG(llm)
@@ -224,6 +225,7 @@ else:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    # CHAT INPUT IS HERE (Only appears after PDF is processed)
     query = st.chat_input("Ask any question about your document...")
 
     if query:
@@ -293,3 +295,4 @@ Answer:"""
                 tab1.write(hypothetical_doc)
                 tab2.code(graph_context if graph_context else "No clear relationships extracted.")
                 tab3.write(final_context)
+
