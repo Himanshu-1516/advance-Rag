@@ -4,6 +4,7 @@ import tempfile
 import uuid
 import numpy as np
 import networkx as nx
+import faiss  # <-- ADD THIS, missing import causing future crash
 from sentence_transformers import CrossEncoder
 
 from langchain_huggingface import HuggingFaceEmbeddings
