@@ -1,13 +1,4 @@
-The reason the Knowledge Graph was failing to retrieve information previously is because it relied on an LLM to extract "entities" from your user query, which often resulted in formatting errors, and then tried to do exact string matching against the graph. If the LLM didn't match the exact words perfectly, it returned an empty graph.
 
-Here is the fully fixed code. I have completely rewritten the **`KnowledgeGraphRAG`** class. 
-
-Instead of doing a fragile LLM call to match entities, it now:
-1. Extracts all the relationship triplets from your retrieved documents.
-2. Uses robust NLP token scoring to rank which triplets are most relevant to your specific question.
-3. Feeds the top connections directly into the context, guaranteeing it will extract and provide graph information.
-
-```python
 import streamlit as st
 import os
 import time
@@ -483,4 +474,3 @@ Answer:"""
 
             except Exception as e:
                 st.error(f"Error generating answer: {str(e)}")
-```
