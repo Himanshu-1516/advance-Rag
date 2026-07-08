@@ -90,21 +90,19 @@ class SemanticCache:
 
 
 class AdvancedContextBuilder:
-    """Handles Context Compression, Token Reduction, and Deduplication"""
+    """FIX 3: CITATION RELIABILITY. Anchors every single sentence to its exact page."""
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
-    def build_and_compress(self, top_docs, query, max_sentences=12):
-        # 1. Break into individual sentences
+    def build_and_compress(self, top_docs, query, max_sentences=15):
         sentences_with_meta = []
         for doc in top_docs:
-            page = doc.metadata.get('page', '?')
+            page = doc.metadata.get('page', 'Unknown')
             sents = nltk.sent_tokenize(doc.page_content)
             for s in sents:
-                if len(s.strip()) > 20: # Ignore useless short fragments
+                if len(s.strip()) > 20: 
                     sentences_with_meta.append({"text": s.strip(), "page": page})
 
-        # 2. Deduplication (Exact & Substring match to fix chunk overlap)
         unique_sentences = []
         seen = set()
         for item in sentences_with_meta:
@@ -116,37 +114,27 @@ class AdvancedContextBuilder:
         if not unique_sentences:
             return "No relevant context found."
 
-        # 3. Context Compression (Score specific sentences against query)
         pairs = [[query, item["text"]] for item in unique_sentences]
         scores = self.reranker.predict(pairs)
         
         scored_sentences = zip(scores, unique_sentences)
-        
-        # 4. Token Reduction: Sort by score and keep only the top N sentences
         ranked_sentences = sorted(scored_sentences, key=lambda x: x[0], reverse=True)
         compressed_data = ranked_sentences[:max_sentences]
         
-        # 5. Reassemble logically for the LLM
-        page_groups = {}
-        for score, item in compressed_data:
-            if score < -2.0: # Filter out wildly irrelevant sentences
-                continue
-            p = item["page"]
-            if p not in page_groups:
-                page_groups[p] = []
-            page_groups[p].append(item["text"])
-            
         final_context_parts = []
-        for p, sents in page_groups.items():
-            final_context_parts.append(f"[Page {p}]: " + " ".join(sents))
+        # STRICT FORMATTING FOR LLM TO FORCE CITATIONS
+        for score, item in compressed_data:
+            if score > -2.0: 
+                final_context_parts.append(f"[Source: Page {item['page']}] {item['text']}")
             
-        return "\n\n".join(final_context_parts)
+        return "\n".join(final_context_parts)
 
 
 class KnowledgeGraphRAG:
-    def __init__(self, llm):
+    """FIX 2: RELATIONSHIPS. Uses a persistent graph to map connections over time."""
+    def __init__(self, llm, persistent_graph):
         self.llm = llm
-        self.graph = nx.Graph()
+        self.graph = persistent_graph # The graph now lives permanently in the session
 
     def build_graph(self, documents):
         prompt = """Extract factual relationships from the text.
@@ -175,9 +163,10 @@ Text: {text}"""
             return sum(1 for w in query_words if w in text)
 
         scored_edges = sorted(all_edges, key=edge_score, reverse=True)
+        # Return top 15 highest scoring relational facts
         relations = [f"• {u} → ({rel}) → {v}" for u, v, rel in scored_edges[:15] if edge_score((u, v, rel)) > 0]
 
-        return "EXTRACTED KNOWLEDGE GRAPH FACTS:\n" + "\n".join(relations) if relations else ""
+        return "EXTRACTED RELATIONSHIPS:\n" + "\n".join(relations) if relations else ""
 
 
 # ========================= MULTI-CHAT SESSION STATE =========================
@@ -191,6 +180,7 @@ def create_new_chat(name=None):
         "pinecone_index": None,
         "namespace": chat_id,
         "semantic_cache": SemanticCache(embeddings),
+        "knowledge_graph": nx.Graph(), # PERSISTENT GRAPH FOR CROSS-CHAPTER MEMORY
         "doc_name": None,
     }
     return chat_id
@@ -294,7 +284,7 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Advanced Graph RAG System</p>', unsafe_allow_html=True)
-st.caption("HyDE + Hybrid Reranking + Context Compression + Token Reduction + Knowledge Graph")
+st.caption("Multi-Query Synthesis + Persistent Graph + Strict Citations")
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
@@ -307,7 +297,7 @@ for message in chat["chat_history"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-query = st.chat_input("Ask any question about your document...")
+query = st.chat_input("Ask a complex, multi-part question...")
 
 if query:
     chat["chat_history"].append({"role": "user", "content": query})
@@ -315,7 +305,7 @@ if query:
 
     with st.chat_message("assistant"):
         if query.lower().strip() in ["hi", "hello", "hey"]:
-            resp = "Hello! 👋 I am your Advanced Graph RAG Assistant. What would you like to know?"
+            resp = "Hello! 👋 I am equipped for cross-chapter synthesis and relationship mapping. What would you like to know?"
             st.markdown(resp)
             chat["chat_history"].append({"role": "assistant", "content": resp})
         else:
@@ -323,36 +313,47 @@ if query:
                 llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY)
                 retriever = PineconeHybridSearchRetriever(
                     embeddings=embeddings, sparse_encoder=chat["bm25_encoder"],
-                    index=chat["pinecone_index"], alpha=0.5, top_k=8, namespace=chat["namespace"]
+                    index=chat["pinecone_index"], alpha=0.5, top_k=6, namespace=chat["namespace"]
                 )
-                kg_rag = KnowledgeGraphRAG(llm)
-                context_builder = AdvancedContextBuilder(reranker) # INIT NEW BUILDER
+                kg_rag = KnowledgeGraphRAG(llm, chat["knowledge_graph"])
+                context_builder = AdvancedContextBuilder(reranker)
 
                 with st.status("Thinking...", expanded=True) as status:
                     cache_result = chat["semantic_cache"].get_cached_answer(query)
+                    
                     if cache_result:
                         response, sim = cache_result
                         status.update(label=f"Answered from Cache (sim: {sim:.2f})", state="complete")
-                        st.markdown(response)
-                        chat["chat_history"].append({"role": "assistant", "content": response})
                     else:
-                        status.write("Generating HyDE...")
-                        hyde_doc = llm.invoke(f"Answer factually: {query}").content
+                        # FIX 1: CROSS-CHAPTER SYNTHESIS (Multi-Query generation)
+                        status.write("Decomposing question for cross-chapter synthesis...")
+                        mq_prompt = f"Break this complex question down into 3 simpler sub-queries to ensure we find all necessary context across a whole document.\nQuestion: {query}\nOutput ONLY the 3 sub-queries, one per line."
+                        sub_queries = llm.invoke(mq_prompt).content.splitlines()
+                        sub_queries = [q.strip() for q in sub_queries if q.strip()][:3]
+                        sub_queries.append(query) # Always include the original
 
-                        status.write("Retrieving & Reranking Documents...")
-                        retrieved = retriever.invoke(hyde_doc)
+                        status.write("Retrieving across multiple logical pathways...")
+                        all_retrieved = []
+                        for sq in sub_queries:
+                            all_retrieved.extend(retriever.invoke(sq))
+
+                        # Deduplicate retrieved chunks
+                        unique_docs = {doc.page_content: doc for doc in all_retrieved}
+                        retrieved = list(unique_docs.values())
 
                         if retrieved:
+                            status.write("Reranking multi-source documents...")
                             doc_texts = [doc.page_content for doc in retrieved]
-                            scores = reranker.predict([[hyde_doc, text] for text in doc_texts])
-                            top_docs = [doc for _, doc in sorted(zip(scores, retrieved), key=lambda x: x[0], reverse=True)[:5]]
+                            scores = reranker.predict([[query, text] for text in doc_texts])
+                            # Take top 8 highest scoring chunks from ALL pathways
+                            top_docs = [doc for _, doc in sorted(zip(scores, retrieved), key=lambda x: x[0], reverse=True)[:8]]
 
-                            status.write("Extracting Graph & Compressing Context...")
-                            kg_rag.build_graph(top_docs)
+                            status.write("Updating Persistent Graph & Extracting Relationships...")
+                            kg_rag.build_graph(top_docs) # Adds to the chat's permanent memory
                             graph_context = kg_rag.get_graph_context(query)
                             
-                            # ✨ NEW CONTEXT COMPRESSION IN ACTION ✨
-                            compressed_text = context_builder.build_and_compress(top_docs, query)
+                            status.write("Compressing context for citation anchoring...")
+                            compressed_text = context_builder.build_and_compress(top_docs, query, max_sentences=20)
 
                             final_context = ""
                             if graph_context: final_context += graph_context + "\n\n---\n"
@@ -360,21 +361,42 @@ if query:
                         else:
                             final_context = "No relevant context found."
 
-                        status.update(label="Generating Final Answer...", state="running")
-                        prompt = f"Answer using ONLY this context. If not found, say so.\nQuestion: {query}\n\nContext:\n{final_context}"
+                        status.update(label="Synthesizing Final Answer...", state="running")
                         
-                        response = llm.invoke(prompt).content
+                        # FIX 3: STRICT CITATION PROMPTING & SYNTHESIS
+                        final_prompt = f"""You are an expert analytical assistant. Your goals are:
+1. SYNTHESIZE: If the question asks about relationships or requires cross-chapter logic, seamlessly connect the concepts from the provided Context and Relationships.
+2. CITATION MANDATE: Every single factual claim MUST end with an inline citation formatted exactly like this: (Page X).
+   Example: "Entity A causes Entity B (Page 4), which leads to Outcome C (Page 12)."
+   DO NOT make up page numbers. Use ONLY the [Source: Page X] tags provided in the context.
+3. Be comprehensive but do not hallucinate.
+
+Question: {query}
+
+Context Data:
+{final_context}
+
+Synthesized Answer:"""
+                        
+                        response = llm.invoke(final_prompt).content
                         chat["semantic_cache"].add_to_cache(query, response)
                         status.update(label="Done", state="complete")
 
-                        st.markdown(response)
-                        chat["chat_history"].append({"role": "assistant", "content": response})
+                if cache_result:
+                    st.markdown(f"<span class='badge cache-hit'>⚡ CACHE HIT ({sim:.2f})</span><br><br>", unsafe_allow_html=True)
+                
+                st.markdown(response) 
+                chat["chat_history"].append({"role": "assistant", "content": response})
 
-                        with st.expander("🔍 View Context Compression (For Portfolio)"):
-                            st.markdown("**1. Tokens Reduced & Deduplicated Context:**")
-                            st.write(compressed_text)
-                            st.markdown("**2. Knowledge Graph Connections:**")
-                            st.code(graph_context if graph_context else "None extracted.")
+                if not cache_result:
+                    with st.expander("🔍 View Synthesis Data (For Portfolio)"):
+                        st.markdown("**1. Sub-Queries Generated (Multi-Hop):**")
+                        for sq in sub_queries:
+                            st.write(f"- {sq}")
+                        st.markdown("**2. Persistent Graph Relationships Extracted:**")
+                        st.code(graph_context if graph_context else "None extracted.")
+                        st.markdown("**3. Strict Citation-Anchored Context:**")
+                        st.write(compressed_text)
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
