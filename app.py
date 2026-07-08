@@ -28,7 +28,7 @@ from langchain_community.retrievers import PineconeHybridSearchRetriever
 # =========================================================================
 # 🔑 ENTER YOUR HARDCODED KEYS HERE (FALLBACKS FOR USERS WITHOUT KEYS)
 # =========================================================================
-DEFAULT_GROQ_API_KEY = "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"
+DEFAULT_GROQ_API_KEY = "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"
 DEFAULT_PINECONE_API_KEY = "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ"
 # =========================================================================
 
