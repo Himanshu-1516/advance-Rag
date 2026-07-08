@@ -26,7 +26,6 @@ from pinecone import Pinecone, ServerlessSpec
 from langchain_community.retrievers import PineconeHybridSearchRetriever
 
 # ========================= API KEYS & DEFAULT FALLBACKS =========================
-# Fallback API credentials embedded directly within the script to support keyless access
 DEFAULT_GROQ_API_KEY = "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"
 DEFAULT_PINECONE_API_KEY = "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ"
 
@@ -64,7 +63,6 @@ class SemanticCache:
         self.embeddings = embeddings_model
         self.threshold = threshold
         self.dim = 384
-        # Deterministic FAISS Index for caching matching patterns
         self.index = faiss.IndexFlatIP(self.dim)
         self.cache_answers = []
 
@@ -86,34 +84,30 @@ class SemanticCache:
 
 
 class AdvancedContextBuilder:
-    """Handles Context Compression, Sentence-Level Reranking, and Strict Metadata Anchoring."""
+    """Handles Context Compression, Sentence-Level Reranking, and Deduplication."""
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
     def build_and_compress(self, top_docs, query, max_sentences=25):
-        sentences_with_meta = []
+        sentences = []
         for doc in top_docs:
-            # Audit Page Offset: Ensure page mapping matches real PDF page layout (1-indexed representation)
-            raw_page = doc.metadata.get('page', 0)
-            corrected_page = int(raw_page) + 1  
-            
             sents = nltk.sent_tokenize(doc.page_content)
             for s in sents:
                 if len(s.strip()) > 15:
-                    sentences_with_meta.append({"text": s.strip(), "page": corrected_page})
+                    sentences.append(s.strip())
 
         unique_sentences = []
         seen = set()
-        for item in sentences_with_meta:
-            clean_text = item["text"].lower()
+        for s in sentences:
+            clean_text = s.lower()
             if clean_text not in seen:
                 seen.add(clean_text)
-                unique_sentences.append(item)
+                unique_sentences.append(s)
 
         if not unique_sentences:
             return "No relevant context found."
 
-        pairs = [[query, item["text"]] for item in unique_sentences]
+        pairs = [[query, s] for s in unique_sentences]
         scores = self.reranker.predict(pairs)
 
         scored_sentences = zip(scores, unique_sentences)
@@ -121,9 +115,9 @@ class AdvancedContextBuilder:
         compressed_data = ranked_sentences[:max_sentences]
 
         final_context_parts = []
-        for score, item in compressed_data:
-            if score > -3.0:  # Retain marginal relationships to avoid multi-hop dropouts
-                final_context_parts.append(f"[Source: Page {item['page']}] {item['text']}")
+        for score, text in compressed_data:
+            if score > -3.0:
+                final_context_parts.append(text)
 
         return "\n".join(final_context_parts)
 
@@ -143,10 +137,7 @@ Output ONLY triplets in this strict format: Entity1 | Relationship | Entity2
 Do not use numbered lists, bullet points, or special characters.
 Text: {text}"""
         for doc in documents:
-            raw_page = doc.metadata.get('page', 0)
-            corrected_page = int(raw_page) + 1
             try:
-                # Enforce zero-temperature configuration on pipeline runs
                 res = self.llm.invoke(prompt.format(text=doc.page_content)).content
                 for line in res.splitlines():
                     if line.count('|') == 2:
@@ -158,7 +149,7 @@ Text: {text}"""
                                 for d in existing.values()
                             )
                             if not already_exists:
-                                self.graph.add_edge(parts[0], parts[2], relation=parts[1], page=corrected_page)
+                                self.graph.add_edge(parts[0], parts[2], relation=parts[1])
             except Exception:
                 continue
 
@@ -171,8 +162,7 @@ Text: {text}"""
         all_facts = []
         for u, v, data in self.graph.edges(data=True):
             rel = data.get('relation', 'is connected to')
-            page = data.get('page', '?')
-            all_facts.append({"u": u, "v": v, "rel": rel, "page": page})
+            all_facts.append({"u": u, "v": v, "rel": rel})
 
         def fact_score(fact):
             text = f"{fact['u']} {fact['rel']} {fact['v']}".lower()
@@ -184,10 +174,9 @@ Text: {text}"""
         if not top_facts:
             return ""
 
-        # Declarative natural statements avoid structured symbols like "->"
         sentences = []
         for f in top_facts:
-            sentences.append(f"Fact: {f['u']} {f['rel']} {f['v']} (Source: Page {f['page']})")
+            sentences.append(f"Fact: {f['u']} {f['rel']} {f['v']}.")
 
         return "EXTRACTED SYSTEM RELATIONSHIPS (Convert these into natural statements, do not copy structural markers):\n" + "\n".join(sentences)
 
@@ -265,7 +254,6 @@ with st.sidebar:
                 loader = PyPDFLoader(tmp_path)
                 docs = loader.load()
                 
-                # Dynamic chunks to guarantee complete document context captures
                 splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=300)
                 chunks = splitter.split_documents(docs)
                 texts = [chunk.page_content for chunk in chunks]
@@ -290,7 +278,7 @@ with st.sidebar:
                     sparse = bm25.encode_documents([text])[0]
                     vectors.append({
                         "id": f"chunk_{i}", "values": dense, "sparse_values": sparse,
-                        "metadata": {"context": text, "page": chunk_.metadata.get("page", 0)}
+                        "metadata": {"context": text}
                     })
 
                 for start_idx in range(0, len(vectors), 100):
@@ -312,8 +300,8 @@ with st.sidebar:
     eval_mode = st.toggle("Enable Regression Runner")
     if eval_mode:
         eval_questions = [
-            {"q": "What is the primary methodology introduced in chapter 1?", "ref": "Check page numbers & methodology description"},
-            {"q": "How does the system scale with higher chunk overlap configuration?", "ref": "Check the cross-chapter synthesis response matching"}
+            {"q": "What is the primary methodology introduced in chapter 1?", "ref": "Methodology description"},
+            {"q": "How does the system scale with higher chunk overlap configuration?", "ref": "Cross-chapter synthesis response matching"}
         ]
         
         st.caption("Auto-checks consistency across consecutive loops.")
@@ -340,7 +328,6 @@ with st.sidebar:
                         ans = llm_eval.invoke(eval_prompt).content
                         runs.append(ans)
                     
-                    # Compute Deterministic consistency score
                     match = "Pass" if len(set(runs)) == 1 else "Inconsistent"
                     st.write(f"Consistency Status: **{match}**")
                     test_results.append(match)
@@ -352,7 +339,7 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Advanced Graph RAG System</p>', unsafe_allow_html=True)
-st.caption("Multi-Query Synthesis + Persistent Graph + Strict Citations (Leak-Free)")
+st.caption("Multi-Query Synthesis + Persistent Graph + Clean Outputs (Leak-Free)")
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
@@ -378,7 +365,6 @@ if query:
             chat["chat_history"].append({"role": "assistant", "content": resp})
         else:
             try:
-                # Temperature explicitly set to 0.0 to prevent semantic and formatting drift
                 llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.0)
                 retriever = PineconeHybridSearchRetriever(
                     embeddings=embeddings, sparse_encoder=chat["bm25_encoder"],
@@ -403,7 +389,6 @@ if query:
                         status.write("Executing path retrieval across parallel indices...")
                         all_retrieved = []
                         for sq in sub_queries:
-                            # Log retrieval step to verify deterministic indexing performance
                             all_retrieved.extend(retriever.invoke(sq))
 
                         unique_docs = {doc.page_content: doc for doc in all_retrieved}
@@ -419,7 +404,7 @@ if query:
                             kg_rag.build_graph(top_docs)
                             graph_context = kg_rag.get_graph_context(query)
 
-                            status.write("Constructing citation-anchored context windows...")
+                            status.write("Constructing context windows...")
                             compressed_text = context_builder.build_and_compress(top_docs, query, max_sentences=25)
 
                             final_context = ""
@@ -431,21 +416,19 @@ if query:
 
                         status.update(label="Formulating Synthesis...", state="running")
 
-                        # Added strict, specific formatting guardrails to the synthesis prompt
                         final_prompt = f"""You are an elite research analyst. Read the Context Data and formulate a complete answer.
 
 Follow these execution parameters strictly:
-1. NO GRAPHICS/LEAKAGE: Never expose raw symbols, arrows (like '->' or '→'), schema structures, or brackets like 'Entity1' in your response. 
-2. EXPLICIT CITATIONS: Every factual assertion you write must end with an inline citation formatted exactly like this: (Page X). Replace X with the actual, verified page number found inside the [Source: Page X] labels. 
-3. Never calculate, estimate, or guess page numbers. If no page number is explicitly provided, use the closest page context or state the page as unknown.
-4. ABSOLUTE TRUTHFULNESS: If the provided Context Data does not contain direct proof to support the claim, output this exact sentence: "I don't have enough information in the document to answer that." Do not extrapolate.
+1. NO GRAPHICS/LEAKAGE: Never expose raw symbols, arrows (like '->' or '→'), schema structures, or brackets like 'Entity1' in your response. Write everything in clean, fluent prose.
+2. ABSOLUTE TRUTHFULNESS: If the provided Context Data does not contain direct proof to support the claim, output this exact sentence: "I don't have enough information in the document to answer that." Do not extrapolate.
+3. NO CITATIONS: Do not mention page numbers, source tags, document names, or citation markers in your final answer. 
 
 Context Data:
 {final_context}
 
 Question: {query}
 
-Analytical, Citation-Backed Response:"""
+Analytical, Citation-Free Response:"""
 
                         response = llm.invoke(final_prompt).content
                         chat["semantic_cache"].add_to_cache(query, response)
@@ -464,7 +447,7 @@ Analytical, Citation-Backed Response:"""
                             st.write(f"- {sq}")
                         st.markdown("**2. Persistent Graph Relationships (Declarative Formats):**")
                         st.code(graph_context if graph_context else "No active relationships extracted for this context.")
-                        st.markdown("**3. Raw Citation-Anchored Context:**")
+                        st.markdown("**3. Raw Compressed Context:**")
                         st.write(compressed_text)
 
             except Exception as e:
