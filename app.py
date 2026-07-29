@@ -362,7 +362,7 @@ Context Data:
 {final_context}
 """
 
-Answer:"""
+Answer:
     raw_response = llm.invoke(final_prompt).content
     response = clean_leakage(raw_response)
 
