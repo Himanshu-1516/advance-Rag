@@ -5,7 +5,6 @@ import tempfile
 import uuid
 import re
 import numpy as np
-import networkx as nx
 import faiss
 import nltk
 from sentence_transformers import CrossEncoder
@@ -73,8 +72,6 @@ def get_llm(deterministic=True):
 
 # ========================= LEAKAGE UTILITIES =========================
 LEAK_PATTERNS = [
-    r"INTERNAL_RELATIONSHIP_NOTES_DO_NOT_QUOTE_DIRECTLY:?",
-    r"EXTRACTED (KNOWLEDGE GRAPH FACTS|RELATIONSHIP FACTS):?",
     r"SOURCE PASSAGES:?",
     r"COMPRESSED DOCUMENT TEXT:?",
 ]
@@ -146,67 +143,6 @@ class AdvancedContextBuilder:
         return "\n".join(parts)
 
 
-class KnowledgeGraphRAG:
-    """
-    Guaranteed unconditional graph build (not probabilistic),
-    direction-validated edges (heuristic check against source sentence order),
-    natural-language output with NO citations, leak-resistant.
-    """
-    def __init__(self, llm, persistent_graph):
-        self.llm = llm
-        self.graph = persistent_graph  # nx.MultiGraph — persists across the whole chat
-
-    def build_graph(self, items):
-        prompt = """Extract factual relationships from the text.
-Output ONLY triplets in this exact format: Entity1 | Relationship | Entity2
-Text: {text}"""
-        for item in items:
-            text = item['text']
-            try:
-                res = self.llm.invoke(prompt.format(text=text)).content
-                for line in res.splitlines():
-                    if line.count('|') == 2:
-                        parts = [p.strip() for p in line.split('|')]
-                        if len(parts) != 3 or parts[0].lower() == "none" or parts[2].lower() == "none":
-                            continue
-                        e1, rel, e2 = parts
-
-                        # Direction-validation heuristic — if e2 actually appears
-                        # BEFORE e1 in the source sentence, the extraction is likely backwards.
-                        pos1 = text.lower().find(e1.lower())
-                        pos2 = text.lower().find(e2.lower())
-                        if pos1 != -1 and pos2 != -1 and pos2 < pos1:
-                            e1, e2 = e2, e1
-
-                        existing = self.graph.get_edge_data(e1, e2) or {}
-                        already = any(d.get('relation', '').lower() == rel.lower() for d in existing.values())
-                        if not already:
-                            self.graph.add_edge(e1, e2, relation=rel)
-            except Exception:
-                continue
-
-    def get_graph_context(self, query):
-        if self.graph.number_of_nodes() == 0:
-            return ""
-
-        query_words = {w for w in set(re.findall(r'\b\w+\b', query.lower())) if len(w) > 3}
-        all_facts = [
-            {"u": u, "v": v, "rel": d.get('relation', 'is related to')}
-            for u, v, d in self.graph.edges(data=True)
-        ]
-
-        def score(f):
-            text = f"{f['u']} {f['rel']} {f['v']}".lower()
-            return sum(1 for w in query_words if w in text)
-
-        top_facts = [f for f in sorted(all_facts, key=score, reverse=True)[:12] if score(f) > 0]
-        if not top_facts:
-            return ""
-
-        lines = [f"{f['u']} {f['rel']} {f['v']}." for f in top_facts]
-        return "INTERNAL_RELATIONSHIP_NOTES_DO_NOT_QUOTE_DIRECTLY:\n" + "\n".join(lines)
-
-
 # ========================= PARENT/NEIGHBOR EXPANSION =========================
 def expand_with_neighbors(top_docs, all_chunks_data, window=1):
     """Hierarchical retrieval: pull in the chunk immediately before/after each
@@ -247,7 +183,7 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
 
     debug = {
         "cache_hit": False, "sub_queries": [], "retrieved_pages": [],
-        "graph_context": "", "compressed_text": "", "final_context": "",
+        "compressed_text": "", "final_context": "",
     }
 
     llm = get_llm(deterministic=deterministic)
@@ -306,22 +242,12 @@ Question: {query}"""
     log("Expanding with neighboring context (parent-document retrieval)...")
     expanded_items = expand_with_neighbors(top_docs, chat["all_chunks_data"], window=1)
 
-    log("Updating persistent knowledge graph...")
-    kg_rag = KnowledgeGraphRAG(llm, chat["knowledge_graph"])
-    top_docs_dicts = [{"text": d.page_content} for d in top_docs]
-    kg_rag.build_graph(top_docs_dicts)
-    graph_context = kg_rag.get_graph_context(query)
-    debug["graph_context"] = graph_context
-
     log("Compressing & deduplicating context...")
     context_builder = AdvancedContextBuilder(reranker)
     compressed_text = context_builder.build_and_compress(expanded_items, query, max_sentences=22)
     debug["compressed_text"] = compressed_text
 
-    final_context = ""
-    if graph_context:
-        final_context += graph_context + "\n\n---\n"
-    final_context += "SOURCE PASSAGES:\n" + compressed_text
+    final_context = "SOURCE PASSAGES:\n" + compressed_text
     debug["final_context"] = final_context
 
     log("Synthesizing final answer...")
@@ -524,7 +450,6 @@ def create_new_chat(name=None):
         "pinecone_index": None,
         "namespace": chat_id,
         "semantic_cache": SemanticCache(embeddings),
-        "knowledge_graph": nx.MultiGraph(),
         "all_chunks_data": [],
         "doc_name": None,
     }
@@ -589,7 +514,7 @@ with st.sidebar:
         help="Turn OFF while debugging consistency — cache hits can mask real pipeline behavior."
     )
     st.session_state.show_debug = st.checkbox(
-        "Show debug info (retrieval / graph / context)", value=st.session_state.show_debug
+        "Show debug info (retrieval / context)", value=st.session_state.show_debug
     )
     if st.button("🧹 Clear Semantic Cache (this chat)"):
         chat["semantic_cache"] = SemanticCache(embeddings)
@@ -691,8 +616,8 @@ with st.sidebar:
         st.rerun()
 
 # ========================= MAIN UI =========================
-st.markdown('<p class="main-header">🧠 Advanced Graph RAG System</p>', unsafe_allow_html=True)
-st.caption("Deterministic • Multi-Hop Retrieval • Leak-Free Graph Synthesis (No Citations)")
+st.markdown('<p class="main-header">🧠 Advanced RAG System</p>', unsafe_allow_html=True)
+st.caption("Deterministic • Multi-Hop Retrieval • Leak-Free Synthesis (No Citations)")
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
@@ -738,14 +663,12 @@ if query:
                 chat["chat_history"].append({"role": "assistant", "content": response})
 
                 if st.session_state.show_debug and not debug.get("cache_hit"):
-                    with st.expander("🔍 Debug: Retrieval, Graph & Context (For QA / Portfolio)"):
+                    with st.expander("🔍 Debug: Retrieval & Context (For QA / Portfolio)"):
                         st.markdown("**Sub-queries used for multi-hop retrieval:**")
                         for sq in debug.get("sub_queries", []):
                             st.write(f"- {sq}")
                         st.markdown("**Retrieved chunks (page / chunk index / preview):**")
                         st.json(debug.get("retrieved_pages", []))
-                        st.markdown("**Internal knowledge-graph facts (never shown to the user):**")
-                        st.code(debug.get("graph_context") or "None extracted.")
                         st.markdown("**Compressed context sent to the LLM:**")
                         st.write(debug.get("compressed_text", ""))
 
