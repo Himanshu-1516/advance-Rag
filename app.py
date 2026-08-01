@@ -110,12 +110,36 @@ class SemanticCache:
 
 
 class AdvancedContextBuilder:
-    """Sentence-level dedup + compression. Page is still tracked internally
-    (useful for debugging) but is NOT surfaced in the prompt/answer anymore."""
+    """Sentence-level dedup + compression.
+
+    FIXED: Previously used a hardcoded absolute threshold (`score > -2.0`)
+    to filter CrossEncoder scores. Since `cross-encoder/ms-marco-MiniLM-L-6-v2`
+    produces UNBOUNDED, UNCALIBRATED raw logits (not probabilities), and
+    sentence-level fragments score systematically lower than full passages
+    due to lost context, that absolute threshold frequently filtered out
+    100% of candidate sentences — even when they were highly relevant.
+    This silently produced an empty context, causing the LLM to falsely
+    report "I don't have enough information."
+
+    FIX: Use Top-K ranking as the primary mechanism (CrossEncoders should be
+    used for RANKING, not classification). Apply an optional RELATIVE
+    score-gap filter (relative to the best score in the batch, not an
+    absolute constant) to trim clearly irrelevant tail sentences. Finally,
+    guarantee a non-empty fallback if filtering would otherwise wipe out
+    everything (empty context is always worse than mediocre context).
+    """
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
-    def build_and_compress(self, items, query, max_sentences=22):
+    def build_and_compress(
+        self,
+        items,
+        query,
+        max_sentences=22,
+        relative_gap=4.0,
+        min_sentences_floor=3,
+        debug_scores=False,
+    ):
         sentences_with_meta = []
         for item in items:
             page = item.get('page', 'Unknown')
@@ -131,16 +155,38 @@ class AdvancedContextBuilder:
                 unique_sentences.append(item)
 
         if not unique_sentences:
-            return "No relevant context found."
+            return "No relevant context found.", []
 
         pairs = [[query, item["text"]] for item in unique_sentences]
         scores = self.reranker.predict(pairs)
-        ranked = sorted(zip(scores, unique_sentences), key=lambda x: x[0], reverse=True)
-        compressed = ranked[:max_sentences]
 
-        # No [Source: Page X] tags injected into the actual text anymore.
-        parts = [item["text"] for score, item in compressed if score > -2.0]
-        return "\n".join(parts)
+        ranked = sorted(
+            zip(scores, unique_sentences),
+            key=lambda x: x[0],
+            reverse=True
+        )
+
+        top_k = ranked[:max_sentences]
+
+        score_log = [(float(s), item["text"][:80]) for s, item in top_k] if debug_scores else []
+
+        if not top_k:
+            return "No relevant context found.", score_log
+
+        best_score = top_k[0][0]
+
+        # Relative filter: keep sentences within `relative_gap` of the best
+        # score in THIS batch — self-calibrating per query, unlike an
+        # absolute constant that assumes a fixed, known score scale.
+        filtered = [item for score, item in top_k if score > best_score - relative_gap]
+
+        # Safety net: never return empty context if we actually had candidates.
+        # This is the critical fix for the reported bug.
+        if not filtered:
+            filtered = [item for _, item in top_k[:min_sentences_floor]]
+
+        parts = [item["text"] for item in filtered]
+        return "\n".join(parts), score_log
 
 
 # ========================= PARENT/NEIGHBOR EXPANSION =========================
@@ -183,7 +229,7 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
 
     debug = {
         "cache_hit": False, "sub_queries": [], "retrieved_pages": [],
-        "compressed_text": "", "final_context": "",
+        "compressed_text": "", "final_context": "", "compression_scores": [],
     }
 
     llm = get_llm(deterministic=deterministic)
@@ -244,8 +290,21 @@ Question: {query}"""
 
     log("Compressing & deduplicating context...")
     context_builder = AdvancedContextBuilder(reranker)
-    compressed_text = context_builder.build_and_compress(expanded_items, query, max_sentences=22)
+    compressed_text, score_log = context_builder.build_and_compress(
+        expanded_items, query, max_sentences=22, debug_scores=(status is not None)
+    )
     debug["compressed_text"] = compressed_text
+    debug["compression_scores"] = score_log
+
+    # Extra safety net at the pipeline level: if compression somehow still
+    # returns nothing (e.g., expanded_items was empty), fall back to the
+    # raw top reranked chunks so we NEVER send an empty context to the LLM
+    # while retrieved/expanded content actually exists.
+    if not compressed_text or not compressed_text.strip() or compressed_text == "No relevant context found.":
+        log("⚠️ Compression returned empty — falling back to raw top chunks.")
+        fallback_texts = [item["text"] for item in expanded_items[:8]]
+        compressed_text = "\n".join(fallback_texts) if fallback_texts else "No relevant context found."
+        debug["compressed_text"] = compressed_text
 
     final_context = "SOURCE PASSAGES:\n" + compressed_text
     debug["final_context"] = final_context
@@ -669,6 +728,8 @@ if query:
                             st.write(f"- {sq}")
                         st.markdown("**Retrieved chunks (page / chunk index / preview):**")
                         st.json(debug.get("retrieved_pages", []))
+                        st.markdown("**Compression scores (score, sentence preview) — for diagnosing empty-context bugs:**")
+                        st.json(debug.get("compression_scores", []))
                         st.markdown("**Compressed context sent to the LLM:**")
                         st.write(debug.get("compressed_text", ""))
 
