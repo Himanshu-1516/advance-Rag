@@ -23,14 +23,45 @@ from pinecone_text.sparse import BM25Encoder
 from pinecone import Pinecone, ServerlessSpec
 from langchain_community.retrievers import PineconeHybridSearchRetriever
 
+# ========================= LANGSMITH (TRACING) =========================
+# pip install -U langsmith  (already pulled in transitively by langchain, but
+# listed explicitly so tracing works even on minimal installs)
+try:
+    from langsmith import traceable, Client as LangSmithClient
+    try:
+        from langsmith.run_helpers import get_current_run_tree
+    except Exception:
+        from langsmith import get_current_run_tree  # fallback for newer SDKs
+    LANGSMITH_SDK_AVAILABLE = True
+except Exception:
+    LANGSMITH_SDK_AVAILABLE = False
+    # No-op fallback decorator so the app still runs if langsmith isn't installed
+    def traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        return decorator
+    def get_current_run_tree():
+        return None
+
 # ========================= API KEYS =========================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "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")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
 GROQ_MODEL = os.getenv("GROQ_MODEL") or st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
+# --- LangSmith config ---
+LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or st.secrets.get("LANGSMITH_API_KEY", "")
+LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT") or st.secrets.get("LANGSMITH_PROJECT", "graph-rag-live-demo")
+LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT") or st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+
 KEYS_CONFIGURED = (
     GROQ_API_KEY and "PASTE_YOUR" not in GROQ_API_KEY and
     PINECONE_API_KEY and "PASTE_YOUR" not in PINECONE_API_KEY
+)
+
+LANGSMITH_CONFIGURED = bool(
+    LANGSMITH_SDK_AVAILABLE and LANGSMITH_API_KEY and "PASTE_YOUR" not in LANGSMITH_API_KEY
 )
 
 # ========================= PAGE CONFIG =========================
@@ -41,12 +72,54 @@ st.markdown("""
     .main-header {font-size: 42px; font-weight: bold; color: #1E3A8A;}
     .badge {padding: 4px 12px; border-radius: 12px; font-size: 13px; font-weight: bold;}
     .cache-hit {background-color: #22c55e; color: white;}
+    .trace-badge {background-color: #6366f1; color: white;}
 </style>
 """, unsafe_allow_html=True)
 
 if not KEYS_CONFIGURED:
     st.error("⚠️ API keys are not configured yet. Please set `GROQ_API_KEY` and `PINECONE_API_KEY` in the script.")
     st.stop()
+
+# ========================= LANGSMITH SETUP =========================
+st.session_state.setdefault("langsmith_tracing_enabled", LANGSMITH_CONFIGURED)
+
+def apply_langsmith_env(enabled: bool):
+    """Toggle tracing on/off at runtime by (un)setting the env vars the
+    LangChain global tracer reads on every call."""
+    if enabled and LANGSMITH_CONFIGURED:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_ENDPOINT"] = LANGSMITH_ENDPOINT
+        os.environ["LANGCHAIN_API_KEY"] = LANGSMITH_API_KEY
+        os.environ["LANGCHAIN_PROJECT"] = LANGSMITH_PROJECT
+    else:
+        os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
+apply_langsmith_env(st.session_state.langsmith_tracing_enabled)
+
+@st.cache_resource
+def get_langsmith_client():
+    if not LANGSMITH_CONFIGURED:
+        return None
+    try:
+        return LangSmithClient(api_key=LANGSMITH_API_KEY, api_url=LANGSMITH_ENDPOINT)
+    except Exception:
+        return None
+
+langsmith_client = get_langsmith_client()
+
+def get_trace_url(run_tree):
+    """Best-effort retrieval of a clickable LangSmith trace URL for the
+    currently executing run. Fails silently if the SDK version doesn't
+    support it or tracing is disabled."""
+    if not (run_tree and langsmith_client and st.session_state.langsmith_tracing_enabled):
+        return None
+    try:
+        return langsmith_client.get_run_url(run=run_tree)
+    except Exception:
+        try:
+            return f"https://smith.langchain.com/o/-/projects/p/{LANGSMITH_PROJECT}"
+        except Exception:
+            return None
 
 # ========================= CACHED RESOURCES =========================
 @st.cache_resource
@@ -131,6 +204,7 @@ class AdvancedContextBuilder:
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
+    @traceable(run_type="chain", name="Context Compression & Dedup")
     def build_and_compress(
         self,
         items,
@@ -190,6 +264,7 @@ class AdvancedContextBuilder:
 
 
 # ========================= PARENT/NEIGHBOR EXPANSION =========================
+@traceable(run_type="tool", name="Neighbor Expansion (Parent Document)")
 def expand_with_neighbors(top_docs, all_chunks_data, window=1):
     """Hierarchical retrieval: pull in the chunk immediately before/after each
     retrieved chunk so connective tissue between two sections isn't cut off mid-thought."""
@@ -212,6 +287,7 @@ def expand_with_neighbors(top_docs, all_chunks_data, window=1):
 
 
 # ========================= CONSISTENCY SCORING =========================
+@traceable(run_type="chain", name="Consistency Scoring")
 def compute_consistency(responses):
     if len(responses) < 2:
         return 1.0
@@ -222,6 +298,7 @@ def compute_consistency(responses):
 
 
 # ========================= CORE PIPELINE (SHARED BY CHAT UI + EVAL HARNESS) =========================
+@traceable(run_type="chain", name="RAG Pipeline")
 def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=None):
     def log(msg):
         if status is not None:
@@ -230,7 +307,19 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
     debug = {
         "cache_hit": False, "sub_queries": [], "retrieved_pages": [],
         "compressed_text": "", "final_context": "", "compression_scores": [],
+        "trace_url": None,
     }
+
+    # Capture the trace URL for THIS run as early as possible so it's
+    # available in the UI even if something downstream fails.
+    try:
+        run_tree = get_current_run_tree()
+        debug["trace_url"] = get_trace_url(run_tree)
+    except Exception:
+        pass
+
+    run_tags = ["deterministic" if deterministic else "sampled", f"chat:{chat['namespace']}"]
+    run_metadata = {"chat_id": chat["namespace"], "doc_name": chat.get("doc_name"), "use_cache": use_cache}
 
     llm = get_llm(deterministic=deterministic)
 
@@ -249,7 +338,11 @@ multi-part questions spanning different sections). Output ONLY the sub-questions
 one per line, no numbering, no extra text.
 Question: {query}"""
     try:
-        raw_sub = llm.invoke(mq_prompt).content
+        raw_sub = llm.invoke(
+            mq_prompt,
+            config={"tags": run_tags + ["query-decomposition"], "metadata": run_metadata,
+                    "run_name": "Query Decomposition"}
+        ).content
         sub_queries = [s.strip("-• ").strip() for s in raw_sub.splitlines() if s.strip()][:3]
     except Exception:
         sub_queries = []
@@ -265,7 +358,13 @@ Question: {query}"""
     all_retrieved = []
     for sq in sub_queries:
         try:
-            all_retrieved.extend(retriever.invoke(sq))
+            all_retrieved.extend(
+                retriever.invoke(
+                    sq,
+                    config={"tags": run_tags + ["hybrid-retrieval"], "metadata": run_metadata,
+                            "run_name": "Hybrid Retrieval"}
+                )
+            )
         except Exception:
             continue
 
@@ -489,7 +588,11 @@ CONTEXT DATA
 Now provide the final answer, following all rules above.
 
 Answer:"""
-    raw_response = llm.invoke(final_prompt).content
+    raw_response = llm.invoke(
+        final_prompt,
+        config={"tags": run_tags + ["final-synthesis"], "metadata": run_metadata,
+                "run_name": "Final Answer Synthesis"}
+    ).content
     response = clean_leakage(raw_response)
 
     if use_cache:
@@ -578,6 +681,31 @@ with st.sidebar:
     if st.button("🧹 Clear Semantic Cache (this chat)"):
         chat["semantic_cache"] = SemanticCache(embeddings)
         st.success("Cache cleared for this chat.")
+
+    st.divider()
+    st.header("🔎 LangSmith Tracing")
+    if not LANGSMITH_SDK_AVAILABLE:
+        st.warning("`langsmith` package not installed. Run `pip install -U langsmith`.")
+    elif not LANGSMITH_CONFIGURED:
+        st.warning(
+            "LangSmith API key not configured. Set `LANGSMITH_API_KEY` (and optionally "
+            "`LANGSMITH_PROJECT`) as an env var or Streamlit secret to enable tracing."
+        )
+    else:
+        toggled = st.checkbox(
+            "Enable tracing", value=st.session_state.langsmith_tracing_enabled,
+            help="Sends every LLM call, retrieval, and pipeline step to LangSmith for inspection."
+        )
+        if toggled != st.session_state.langsmith_tracing_enabled:
+            st.session_state.langsmith_tracing_enabled = toggled
+            apply_langsmith_env(toggled)
+            st.rerun()
+
+        if st.session_state.langsmith_tracing_enabled:
+            st.success(f"✅ Tracing ON · Project: `{LANGSMITH_PROJECT}`")
+            st.markdown(f"[🔗 Open LangSmith Project Dashboard](https://smith.langchain.com/)")
+        else:
+            st.info("Tracing is currently OFF.")
 
     st.divider()
     st.header("🛠️ Document Setup")
@@ -676,7 +804,7 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Advanced RAG System</p>', unsafe_allow_html=True)
-st.caption("Deterministic • Multi-Hop Retrieval • Leak-Free Synthesis (No Citations)")
+st.caption("Deterministic • Multi-Hop Retrieval • Leak-Free Synthesis (No Citations) • LangSmith Traced")
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
@@ -721,6 +849,12 @@ if query:
                 st.markdown(response)
                 chat["chat_history"].append({"role": "assistant", "content": response})
 
+                if debug.get("trace_url"):
+                    st.markdown(
+                        f"<span class='badge trace-badge'>🔗 <a href='{debug['trace_url']}' target='_blank' style='color:white;'>View trace in LangSmith</a></span>",
+                        unsafe_allow_html=True
+                    )
+
                 if st.session_state.show_debug and not debug.get("cache_hit"):
                     with st.expander("🔍 Debug: Retrieval & Context (For QA / Portfolio)"):
                         st.markdown("**Sub-queries used for multi-hop retrieval:**")
@@ -732,6 +866,8 @@ if query:
                         st.json(debug.get("compression_scores", []))
                         st.markdown("**Compressed context sent to the LLM:**")
                         st.write(debug.get("compressed_text", ""))
+                        if debug.get("trace_url"):
+                            st.markdown(f"**LangSmith trace:** [{debug['trace_url']}]({debug['trace_url']})")
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
@@ -741,7 +877,8 @@ st.divider()
 with st.expander("🧪 Evaluation Harness — Consistency Testing"):
     st.caption(
         "Run the same questions multiple times to verify determinism and detect drift — "
-        "without doing it manually every time."
+        "without doing it manually every time. Every run is also traced to LangSmith "
+        "(if enabled) under the `deterministic` / `sampled` tags for later inspection."
     )
     default_qs = "What is the main topic of this document?\nHow does the first major concept connect to the last one discussed?"
     test_qs_raw = st.text_area("Test questions (one per line)", value=default_qs, height=120,
@@ -757,9 +894,11 @@ with st.expander("🧪 Evaluation Harness — Consistency Testing"):
 
         for q in questions:
             responses = []
+            trace_urls = []
             for _ in range(runs_per_q):
-                resp, _ = run_rag_pipeline(q, chat, deterministic=True, use_cache=False, status=None)
+                resp, dbg = run_rag_pipeline(q, chat, deterministic=True, use_cache=False, status=None)
                 responses.append(resp)
+                trace_urls.append(dbg.get("trace_url"))
                 step += 1
                 progress.progress(step / total)
 
@@ -767,7 +906,8 @@ with st.expander("🧪 Evaluation Harness — Consistency Testing"):
             results.append({
                 "Question": q,
                 "Consistency Score (0-1)": round(consistency, 3),
-                "Sample Answer": responses[0][:200] + ("..." if len(responses[0]) > 200 else "")
+                "Sample Answer": responses[0][:200] + ("..." if len(responses[0]) > 200 else ""),
+                "Trace (Run 1)": trace_urls[0] if trace_urls else None,
             })
 
         st.session_state[f"eval_results_{st.session_state.current_chat_id}"] = results
@@ -777,5 +917,6 @@ with st.expander("🧪 Evaluation Harness — Consistency Testing"):
         st.dataframe(st.session_state[results_key], use_container_width=True)
         st.caption(
             "Consistency Score ≥ 0.9 typically means near-identical answers across runs. "
-            "Anything below ~0.7 indicates the pipeline is still non-deterministic for that question type."
+            "Anything below ~0.7 indicates the pipeline is still non-deterministic for that question type. "
+            "Click a trace link to inspect the exact retrieval/context/prompt for that specific run in LangSmith."
         )
