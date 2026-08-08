@@ -4,7 +4,9 @@ import time
 import tempfile
 import uuid
 import re
+import io as io_module
 import numpy as np
+import pandas as pd
 import faiss
 import nltk
 from sentence_transformers import CrossEncoder
@@ -23,9 +25,27 @@ from pinecone_text.sparse import BM25Encoder
 from pinecone import Pinecone, ServerlessSpec
 from langchain_community.retrievers import PineconeHybridSearchRetriever
 
+# ========================= OPTIONAL: TABLE / IMAGE EXTRACTION =========================
+try:
+    import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
+
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
 # ========================= LANGSMITH (TRACING) =========================
-# pip install -U langsmith  (already pulled in transitively by langchain, but
-# listed explicitly so tracing works even on minimal installs)
 try:
     from langsmith import traceable, Client as LangSmithClient
     try:
@@ -35,7 +55,6 @@ try:
     LANGSMITH_SDK_AVAILABLE = True
 except Exception:
     LANGSMITH_SDK_AVAILABLE = False
-    # No-op fallback decorator so the app still runs if langsmith isn't installed
     def traceable(*args, **kwargs):
         def decorator(func):
             return func
@@ -50,7 +69,6 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "gsk_
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
 GROQ_MODEL = os.getenv("GROQ_MODEL") or st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# --- LangSmith config ---
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or st.secrets.get("LANGSMITH_API_KEY", "")
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT") or st.secrets.get("LANGSMITH_PROJECT", "graph-rag-live-demo")
 LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT") or st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
@@ -84,8 +102,6 @@ if not KEYS_CONFIGURED:
 st.session_state.setdefault("langsmith_tracing_enabled", LANGSMITH_CONFIGURED)
 
 def apply_langsmith_env(enabled: bool):
-    """Toggle tracing on/off at runtime by (un)setting the env vars the
-    LangChain global tracer reads on every call."""
     if enabled and LANGSMITH_CONFIGURED:
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_ENDPOINT"] = LANGSMITH_ENDPOINT
@@ -108,9 +124,6 @@ def get_langsmith_client():
 langsmith_client = get_langsmith_client()
 
 def get_trace_url(run_tree):
-    """Best-effort retrieval of a clickable LangSmith trace URL for the
-    currently executing run. Fails silently if the SDK version doesn't
-    support it or tracing is disabled."""
     if not (run_tree and langsmith_client and st.session_state.langsmith_tracing_enabled):
         return None
     try:
@@ -135,8 +148,6 @@ reranker = load_reranker()
 
 # ========================= LLM FACTORY (DETERMINISM) =========================
 def get_llm(deterministic=True):
-    """Temperature=0 removes sampling randomness — the #1 source of
-    'same question, different answer' bugs."""
     return ChatGroq(
         model=GROQ_MODEL,
         api_key=GROQ_API_KEY,
@@ -150,11 +161,118 @@ LEAK_PATTERNS = [
 ]
 
 def clean_leakage(text):
-    """Safety-net regex scrubber in case the LLM copies internal markers verbatim."""
     cleaned = text
     for pat in LEAK_PATTERNS:
         cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+# ========================= TABLE / IMAGE EXTRACTION HELPERS =========================
+def extract_tables_as_markdown(pdf_path):
+    """Extract tables with row/column structure preserved (as markdown) so the
+    LLM can actually read cells correctly instead of getting jumbled flat text."""
+    if not PDFPLUMBER_AVAILABLE:
+        return []
+    table_chunks = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                try:
+                    tables = page.extract_tables()
+                except Exception:
+                    tables = []
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    header = table[0]
+                    rows = table[1:]
+                    md = "| " + " | ".join(str(h or "").strip() for h in header) + " |\n"
+                    md += "| " + " | ".join(["---"] * len(header)) + " |\n"
+                    for row in rows:
+                        if row is None:
+                            continue
+                        md += "| " + " | ".join(str(c or "").strip() for c in row) + " |\n"
+                    table_chunks.append({
+                        "text": f"[TABLE from page {page_num}]\n{md}",
+                        "page": page_num,
+                        "type": "table",
+                    })
+    except Exception:
+        pass
+    return table_chunks
+
+
+def extract_images_with_ocr(pdf_path):
+    """Pull embedded images and (if OCR available) read any text/labels inside
+    them — axis labels, chart titles, figure captions — so images aren't
+    completely invisible to the retrieval pipeline."""
+    if not PYMUPDF_AVAILABLE:
+        return []
+    image_chunks = []
+    try:
+        doc = fitz.open(pdf_path)
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            for img in page.get_images(full=True):
+                xref = img[0]
+                try:
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                except Exception:
+                    continue
+
+                ocr_text = ""
+                if OCR_AVAILABLE:
+                    try:
+                        pil_img = Image.open(io_module.BytesIO(image_bytes))
+                        ocr_text = pytesseract.image_to_string(pil_img).strip()
+                    except Exception:
+                        ocr_text = ""
+
+                caption_hint = f"[FIGURE/IMAGE on page {page_num + 1}]"
+                if ocr_text:
+                    caption_hint += f" Extracted text/labels from the image: {ocr_text}"
+                else:
+                    caption_hint += " (No readable text detected in this image — likely a photo, logo, or unlabeled chart.)"
+
+                image_chunks.append({
+                    "text": caption_hint,
+                    "page": page_num + 1,
+                    "type": "image",
+                })
+        doc.close()
+    except Exception:
+        pass
+    return image_chunks
+
+
+# ========================= VISUALIZATION HELPERS =========================
+VISUAL_KEYWORDS = ["chart", "plot", "visuali", "graph", "trend", "compare", "comparison", "vs", "versus"]
+
+def wants_visualization(query):
+    q = query.lower()
+    return any(k in q for k in VISUAL_KEYWORDS)
+
+def extract_markdown_table(text):
+    """Parse the first markdown table found in the LLM's response into a DataFrame."""
+    lines = [l for l in text.splitlines() if l.strip().startswith("|")]
+    if len(lines) < 3:
+        return None
+    try:
+        table_str = "\n".join(lines)
+        df = pd.read_csv(io_module.StringIO(table_str), sep="|", engine="python", skipinitialspace=True)
+        df = df.drop(df.columns[[0, -1]], axis=1)
+        df = df.iloc[1:].reset_index(drop=True)  # drop the "---" separator row
+        df.columns = [str(c).strip() for c in df.columns]
+        for col in df.columns[1:]:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", "").str.extract(r"([-\d.]+)")[0],
+                errors="coerce"
+            )
+        df = df.dropna(how="all", axis=1)
+        return df
+    except Exception:
+        return None
+
 
 # ========================= CLASSES =========================
 class SemanticCache:
@@ -183,23 +301,17 @@ class SemanticCache:
 
 
 class AdvancedContextBuilder:
-    """Sentence-level dedup + compression.
+    """Sentence-level dedup + compression for PROSE, with a separate path for
+    TABLE and IMAGE chunks.
 
-    FIXED: Previously used a hardcoded absolute threshold (`score > -2.0`)
-    to filter CrossEncoder scores. Since `cross-encoder/ms-marco-MiniLM-L-6-v2`
-    produces UNBOUNDED, UNCALIBRATED raw logits (not probabilities), and
-    sentence-level fragments score systematically lower than full passages
-    due to lost context, that absolute threshold frequently filtered out
-    100% of candidate sentences — even when they were highly relevant.
-    This silently produced an empty context, causing the LLM to falsely
-    report "I don't have enough information."
-
-    FIX: Use Top-K ranking as the primary mechanism (CrossEncoders should be
-    used for RANKING, not classification). Apply an optional RELATIVE
-    score-gap filter (relative to the best score in the batch, not an
-    absolute constant) to trim clearly irrelevant tail sentences. Finally,
-    guarantee a non-empty fallback if filtering would otherwise wipe out
-    everything (empty context is always worse than mediocre context).
+    IMPORTANT FIX: Tables/images must NOT be run through nltk.sent_tokenize().
+    A markdown table row like "| May | 120 |" is not a sentence — tokenizing
+    it destroys row/column alignment and the cross-encoder scores fragments
+    of a table far below full prose sentences (out-of-distribution input for
+    a sentence-relevance model), causing tables to be silently dropped from
+    context even when directly relevant. Instead, table/image chunks are kept
+    fully intact and ranked as whole blocks against the query, then combined
+    back into the final context alongside the compressed prose.
     """
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
@@ -212,55 +324,69 @@ class AdvancedContextBuilder:
         max_sentences=22,
         relative_gap=4.0,
         min_sentences_floor=3,
+        max_blocks=5,
         debug_scores=False,
     ):
-        sentences_with_meta = []
-        for item in items:
-            page = item.get('page', 'Unknown')
-            for s in nltk.sent_tokenize(item['text']):
-                if len(s.strip()) > 20:
-                    sentences_with_meta.append({"text": s.strip(), "page": page})
+        sentence_candidates = []
+        whole_block_candidates = []
 
+        for item in items:
+            item_type = item.get("type", "text")
+            page = item.get("page", "Unknown")
+            if item_type in ("table", "image"):
+                whole_block_candidates.append({"text": item["text"], "page": page, "type": item_type})
+            else:
+                for s in nltk.sent_tokenize(item["text"]):
+                    if len(s.strip()) > 20:
+                        sentence_candidates.append({"text": s.strip(), "page": page, "type": "text"})
+
+        # ---- Dedup + rank PROSE sentences ----
         unique_sentences, seen = [], set()
-        for item in sentences_with_meta:
+        for item in sentence_candidates:
             key = item["text"].lower()
             if key not in seen:
                 seen.add(key)
                 unique_sentences.append(item)
 
-        if not unique_sentences:
-            return "No relevant context found.", []
+        score_log = []
+        filtered_sentences = []
 
-        pairs = [[query, item["text"]] for item in unique_sentences]
-        scores = self.reranker.predict(pairs)
+        if unique_sentences:
+            pairs = [[query, item["text"]] for item in unique_sentences]
+            scores = self.reranker.predict(pairs)
+            ranked = sorted(zip(scores, unique_sentences), key=lambda x: x[0], reverse=True)
+            top_k = ranked[:max_sentences]
+            score_log = [(float(s), item["text"][:80]) for s, item in top_k] if debug_scores else []
 
-        ranked = sorted(
-            zip(scores, unique_sentences),
-            key=lambda x: x[0],
-            reverse=True
-        )
+            if top_k:
+                best_score = top_k[0][0]
+                filtered_sentences = [item for score, item in top_k if score > best_score - relative_gap]
+                if not filtered_sentences:
+                    filtered_sentences = [item for _, item in top_k[:min_sentences_floor]]
 
-        top_k = ranked[:max_sentences]
+        # ---- Rank TABLE / IMAGE blocks as whole units ----
+        ranked_blocks = []
+        if whole_block_candidates:
+            block_pairs = [[query, b["text"][:2000]] for b in whole_block_candidates]
+            block_scores = self.reranker.predict(block_pairs)
+            ranked_full = sorted(zip(block_scores, whole_block_candidates), key=lambda x: x[0], reverse=True)
+            top_blocks = ranked_full[:max_blocks]
+            if top_blocks:
+                best_block_score = top_blocks[0][0]
+                ranked_blocks = [b for s, b in top_blocks if s > best_block_score - relative_gap]
+                if not ranked_blocks:
+                    ranked_blocks = [b for _, b in top_blocks[:2]]
 
-        score_log = [(float(s), item["text"][:80]) for s, item in top_k] if debug_scores else []
-
-        if not top_k:
+        if not filtered_sentences and not ranked_blocks:
             return "No relevant context found.", score_log
 
-        best_score = top_k[0][0]
+        parts = []
+        if ranked_blocks:
+            parts.append("\n\n".join(b["text"] for b in ranked_blocks))
+        if filtered_sentences:
+            parts.append("\n".join(item["text"] for item in filtered_sentences))
 
-        # Relative filter: keep sentences within `relative_gap` of the best
-        # score in THIS batch — self-calibrating per query, unlike an
-        # absolute constant that assumes a fixed, known score scale.
-        filtered = [item for score, item in top_k if score > best_score - relative_gap]
-
-        # Safety net: never return empty context if we actually had candidates.
-        # This is the critical fix for the reported bug.
-        if not filtered:
-            filtered = [item for _, item in top_k[:min_sentences_floor]]
-
-        parts = [item["text"] for item in filtered]
-        return "\n".join(parts), score_log
+        return "\n\n".join(parts), score_log
 
 
 # ========================= PARENT/NEIGHBOR EXPANSION =========================
@@ -272,11 +398,12 @@ def expand_with_neighbors(top_docs, all_chunks_data, window=1):
     for doc in top_docs:
         idx = doc.metadata.get("chunk_index")
         page = doc.metadata.get("page", "?")
+        item_type = doc.metadata.get("type", "text")
         text = doc.page_content
         if idx is None:
-            selected[f"raw_{len(selected)}"] = {"text": text, "page": page, "chunk_index": -1}
+            selected[f"raw_{len(selected)}"] = {"text": text, "page": page, "chunk_index": -1, "type": item_type}
             continue
-        selected[idx] = {"text": text, "page": page, "chunk_index": idx}
+        selected[idx] = {"text": text, "page": page, "chunk_index": idx, "type": item_type}
         for offset in range(1, window + 1):
             for n_idx in (idx - offset, idx + offset):
                 if 0 <= n_idx < len(all_chunks_data) and n_idx not in selected:
@@ -310,8 +437,6 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
         "trace_url": None,
     }
 
-    # Capture the trace URL for THIS run as early as possible so it's
-    # available in the UI even if something downstream fails.
     try:
         run_tree = get_current_run_tree()
         debug["trace_url"] = get_trace_url(run_tree)
@@ -334,8 +459,8 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
     log("Decomposing question into sub-queries...")
     mq_prompt = f"""Break this question into up to 3 simpler, self-contained sub-questions
 that together would let you fully answer it (useful for "how does X connect to Y" or
-multi-part questions spanning different sections). Output ONLY the sub-questions,
-one per line, no numbering, no extra text.
+multi-part questions spanning different sections, tables, or figures). Output ONLY the
+sub-questions, one per line, no numbering, no extra text.
 Question: {query}"""
     try:
         raw_sub = llm.invoke(
@@ -381,13 +506,13 @@ Question: {query}"""
 
     debug["retrieved_pages"] = [
         {"page": d.metadata.get("page", "?"), "chunk_index": d.metadata.get("chunk_index", "?"),
-         "preview": d.page_content[:120] + "..."} for d in top_docs
+         "type": d.metadata.get("type", "text"), "preview": d.page_content[:120] + "..."} for d in top_docs
     ]
 
     log("Expanding with neighboring context (parent-document retrieval)...")
     expanded_items = expand_with_neighbors(top_docs, chat["all_chunks_data"], window=1)
 
-    log("Compressing & deduplicating context...")
+    log("Compressing & deduplicating context (tables/images kept intact)...")
     context_builder = AdvancedContextBuilder(reranker)
     compressed_text, score_log = context_builder.build_and_compress(
         expanded_items, query, max_sentences=22, debug_scores=(status is not None)
@@ -395,10 +520,6 @@ Question: {query}"""
     debug["compressed_text"] = compressed_text
     debug["compression_scores"] = score_log
 
-    # Extra safety net at the pipeline level: if compression somehow still
-    # returns nothing (e.g., expanded_items was empty), fall back to the
-    # raw top reranked chunks so we NEVER send an empty context to the LLM
-    # while retrieved/expanded content actually exists.
     if not compressed_text or not compressed_text.strip() or compressed_text == "No relevant context found.":
         log("⚠️ Compression returned empty — falling back to raw top chunks.")
         fallback_texts = [item["text"] for item in expanded_items[:8]]
@@ -414,6 +535,12 @@ production question-answering system. Your single most important responsibility 
 FACTUAL FIDELITY to the provided Context Data. You must never sound confident about
 something the Context Data does not actually support.
 
+The Context Data may contain THREE kinds of content, each marked accordingly:
+- Plain prose text (no special marker)
+- Tables, marked "[TABLE from page X]" followed by a markdown table
+- Figures/images, marked "[FIGURE/IMAGE from page X]" followed by any extracted
+  text/labels found inside that image (or a note that no text was detected)
+
 ====================================================================
 SECTION 1 — CORE GROUNDING PRINCIPLE
 ====================================================================
@@ -423,12 +550,13 @@ SECTION 1 — CORE GROUNDING PRINCIPLE
   knowledge about the topic — even if you "know" the correct answer.
 - Do not fill gaps with plausible-sounding information. If the Context Data is
   silent on something, treat it as unknown, not as something you can reasonably guess.
-- If the Context Data contains multiple documents or chunks, treat each as a
-  separate source of truth. Do not assume two chunks are related just because
+- If the Context Data contains multiple documents, tables, or chunks, treat each
+  as a separate source of truth. Do not assume two chunks are related just because
   they appear near each other or share a keyword.
 - Numbers, dates, names, and figures must be copied or paraphrased exactly as
   they appear. Never round, estimate, recalculate, or "correct" a number found
-  in the Context Data.
+  in the Context Data — except where Section 2B explicitly asks you to compute
+  a derived value (sum, difference, %, etc.) from stated numbers.
 
 ====================================================================
 SECTION 2 — CLASSIFY THE QUESTION FIRST (internally, do not show this step)
@@ -437,75 +565,119 @@ SECTION 2 — CLASSIFY THE QUESTION FIRST (internally, do not show this step)
 Before answering, silently determine which category the question falls into:
 
 1. OVERVIEW / SUMMARY
-   Examples: "What is this document about?", "Summarize this", "What topics
-   does this cover?", "Give me a high-level summary."
-   → Behavior: Synthesize themes and main subjects across the entire Context
-     Data. Combining information from multiple passages into a coherent
-     description IS correct and expected here. Prioritize breadth and
-     structure (what the document covers, key sections, main entities/topics)
-     over exhaustive detail.
+   → Synthesize themes and main subjects across the entire Context Data,
+     including what tables/figures are present. Prioritize breadth and
+     structure over exhaustive detail.
 
 2. SPECIFIC FACTUAL
-   Examples: asking for a number, date, name, definition, cause, status, or a
-   single stated fact.
-   → Behavior: Answer using the single most relevant passage. Paraphrase it
-     cleanly. Do NOT merge details from other passages unless the text
-     explicitly connects them. If two passages give conflicting information,
-     report both and note the conflict rather than picking one silently.
+   → Answer using the single most relevant passage, table row, or figure.
+     Do NOT merge details from unrelated passages unless explicitly connected.
+     If sources conflict, report both and note the conflict.
 
 3. RELATIONSHIP / CAUSAL
-   Examples: "How does X affect Y?", "What is the relationship between X and Y?",
-   "Why did X happen?"
-   → Behavior: Only state a relationship if the Context Data explicitly
-     describes one (using language like "causes," "leads to," "is due to,"
-     "results in," "because," etc.). If X and Y are only mentioned in separate,
-     unconnected passages, say that no explicit relationship is stated in the
-     document, rather than inferring one.
+   → Only state a relationship if explicitly described in the text (using
+     language like "causes," "leads to," "results in," "because," etc.).
+     Otherwise say no explicit relationship is stated.
 
 4. LIST / ENUMERATION
-   Examples: "What are the steps...", "List the requirements...", "What
-   factors are mentioned..."
-   → Behavior: Extract all explicitly stated items relevant to the question.
-     Do not invent additional items to make the list feel complete. If the
-     document lists items partially or across multiple sections, you may
-     consolidate them into one list, but only include items that are
-     genuinely present.
+   → Extract all explicitly stated relevant items. Do not invent items to
+     make a list feel complete.
 
 5. COMPARISON
-   Examples: "What is the difference between X and Y?", "Compare A and B."
-   → Behavior: Only compare attributes that are explicitly stated for both
-     items. If information exists for one item but not the other, say so
-     explicitly instead of inferring the missing side.
+   → Only compare attributes explicitly stated for both items being compared.
+     If data exists for only one side, say so explicitly.
 
 6. YES/NO or VERIFICATION
-   Examples: "Does the document mention...", "Is X true according to this?"
-   → Behavior: Answer directly (yes/no/not stated), then support with a brief
-     paraphrase of the relevant passage. Do not hedge unnecessarily if the
-     document is clear.
+   → Answer directly (yes/no/not stated), then support with a brief
+     paraphrase of the relevant passage or data.
 
 7. MULTI-PART
-   Examples: questions containing "and" joining multiple sub-questions.
-   → Behavior: Address each part separately and explicitly. If the Context
-     Data answers only some parts, answer those fully and clearly state which
-     parts are not covered.
+   → Address each part separately. If only some parts are covered, answer
+     those and clearly state which parts are not covered.
+
+Note: In addition to the categories above, also apply Section 2B whenever the
+question involves tables, figures/images, numeric comparisons, calculations,
+or a request to "visualize"/"chart"/"plot" something — these can layer on
+top of any category above (e.g., a COMPARISON question about a sales table).
+
+====================================================================
+SECTION 2B — DATA, TABLE & IMAGE REASONING (perform internally, silently)
+====================================================================
+
+A. TABLE-GROUNDED QUESTIONS (asking about specific rows, columns, time
+   periods, categories, or values that live inside a table)
+   Step 1 — Locate: Identify every table row/column in the Context Data
+     relevant to the entities in the question (e.g., specific months,
+     products, regions, categories).
+   Step 2 — Extract: Pull the exact values for each relevant row/column.
+     Do not approximate or infer a value that isn't explicitly in a cell.
+   Step 3 — Compute (if asked): If the question requires a derived result —
+     difference, sum, average, percentage change, ranking, trend — perform
+     the calculation yourself using only the extracted values, and show the
+     numbers you used (e.g., "May: 120 units, June: 150 units → an increase
+     of 30 units, or 25%"). Never state a computed result without showing
+     the figures behind it.
+   Step 4 — If a needed value is missing from every table in the Context
+     Data, say so explicitly rather than estimating it.
+   Step 5 — Present: Report the extracted values and reasoning in plain
+     prose, AND reproduce the relevant figures as a compact markdown table
+     when the question involves 3+ data points or an explicit comparison —
+     this lets the interface render an actual chart from it.
+
+B. IMAGE / FIGURE-GROUNDED QUESTIONS (e.g., "what does the chart on page 4
+   show", "describe the diagram", "what does the image say")
+   - Use only the OCR'd text/labels or caption text provided for that image.
+   - If the image entry indicates no readable text was detected, plainly
+     tell the user the document contains an image there but its content
+     could not be extracted as text — do not guess what it depicts.
+   - Never invent visual details (colors, shapes, chart type) not stated in
+     the extracted text.
+
+C. VISUALIZATION REQUESTS (e.g., "show me a chart", "visualize this",
+   "plot the trend", "graph the comparison")
+   - You cannot render an actual image, so produce the most chart-ready
+     structured representation of the requested data as a markdown table
+     (clear numeric columns), followed by a short written interpretation
+     of the pattern (trend, comparison, spike, decline, etc.).
+   - ALWAYS put the raw data table BEFORE the interpretation, so the
+     surrounding application can detect and render it as a real chart.
+   - If requested data spans values not present in the Context Data, build
+     the table only from what is available and explicitly note what's missing.
+   - Never describe a chart in words instead of providing the table.
+
+D. MULTI-STEP ANALYTICAL QUESTIONS (comparisons, trends, calculations
+   spanning multiple data points, tables, or sections)
+   - Break the task into explicit internal steps: (1) identify what data
+     points are required, (2) locate each in the Context Data, (3) note any
+     that are missing, (4) perform any necessary computation, (5) synthesize
+     a plain-language conclusion.
+   - Never refuse a comparison/calculation just because the numbers live in
+     different tables, rows, or pages — as long as each individual value is
+     explicitly present somewhere in the Context Data, combining them to
+     answer the question IS correct and expected. This is different from
+     Section 3's rule against blending unrelated prose passages: numeric
+     extraction-and-computation across tables is a legitimate, expected
+     operation, not hallucination.
+   - Only say data is unavailable when a specific required number is
+     genuinely absent from all retrieved content.
 
 ====================================================================
 SECTION 3 — ANTI-HALLUCINATION SAFEGUARDS
 ====================================================================
 
-- Never guess a relationship, cause, or connection that is not explicitly
-  written in the Context Data, even if it seems logical or likely.
-- Never blend two distant or unrelated passages into a single fabricated
-  claim. This is the single most common source of factual drift — avoid it.
-- If the Context Data is ambiguous, ONLY report the ambiguity rather than
-  resolving it yourself with an assumption.
+- Never guess a relationship, cause, or connection not explicitly written
+  in the Context Data, even if it seems logical or likely.
+- Never blend two distant or unrelated PROSE passages into a single
+  fabricated claim (this rule does not restrict legitimate numeric
+  computation across tables per Section 2B-D).
+- If the Context Data is ambiguous, report the ambiguity rather than
+  resolving it with an assumption.
 - If the Context Data contains contradictory statements, present both
-  statements neutrally (e.g., "one section states X, while another states Y")
-  instead of choosing one as correct.
+  neutrally instead of choosing one as correct.
 - Do not extrapolate trends, implications, or conclusions beyond what is
-  directly stated.
-- Do not add caveats, disclaimers, or "in general" statements that are not
-  grounded in the Context Data.
+  directly stated or directly computable from stated numbers.
+- Do not add caveats, disclaimers, or "in general" statements not grounded
+  in the Context Data.
 - If a name, number, or term is not explicitly present in the Context Data,
   do not introduce it into your answer under any circumstance.
 
@@ -516,12 +688,10 @@ SECTION 4 — HANDLING INSUFFICIENT OR PARTIAL INFORMATION
 - If the Context Data contains NOTHING relevant to the question, respond
   exactly with:
   "I don't have enough information in the document to answer that."
-
 - If the Context Data contains SOME relevant information but not a complete
   answer, do NOT refuse. Instead:
-  1. Provide what is explicitly supported.
-  2. Clearly state which part of the question is not addressed by the
-     available content (e.g., "The document does not specify...").
+  1. Provide what is explicitly supported (including any usable table/figure data).
+  2. Clearly state which part of the question is not addressed.
 - Never treat partial coverage as equivalent to no coverage.
 - Never pad an incomplete answer with speculation to make it feel complete.
 
@@ -540,8 +710,15 @@ SECTION 5 — OUTPUT FORMATTING RULES
 - You may use plain paragraph structure or simple numbered/lettered lists
   (using normal text, e.g., "1.", "2.") when listing multiple items, but do
   not use decorative bullet symbols.
-- Keep formatting consistent with a finished, human-written document — no
-  visible traces of the retrieval or context-assembly process.
+- EXCEPTION — TABLES ARE REQUIRED OUTPUT, NOT LEAKAGE: When the answer
+  involves comparing 3+ values, numeric trends, or an explicit chart/
+  visualization/comparison request, you MUST include a compact, clean
+  markdown table of the relevant figures BEFORE your written explanation.
+  Use standard markdown table syntax (| Column | Column |) so it can be
+  parsed and rendered as a chart by the application.
+- Keep formatting consistent with a finished, human-written document aside
+  from the table exception above — no visible traces of the retrieval or
+  context-assembly process.
 
 ====================================================================
 SECTION 6 — TONE AND STYLE
@@ -550,26 +727,26 @@ SECTION 6 — TONE AND STYLE
 - Be direct and confident when the Context Data clearly supports the answer.
 - Be transparent and measured when the Context Data only partially supports
   the answer — use phrases like "the document states..." or "according to the
-  provided content..." rather than absolute certainty language when the
-  source itself is limited or vague.
-- Avoid filler phrases, over-hedging, or unnecessary repetition of the
-  question.
-- Match the length of the answer to the complexity of the question: a short
-  factual question deserves a concise answer; an overview/summary question
-  deserves a fuller, structured response.
+  provided data..." rather than absolute certainty language when the source
+  itself is limited or vague.
+- Avoid filler phrases, over-hedging, or unnecessary repetition of the question.
+- Match the length of the answer to the complexity of the question.
 
 ====================================================================
 SECTION 7 — FINAL SELF-CHECK (perform silently before responding)
 ====================================================================
 
 Before finalizing your answer, verify internally:
-1. Is every claim in my answer directly traceable to the Context Data?
-2. Have I avoided connecting two passages unless the text itself connects them?
+1. Is every claim in my answer directly traceable to the Context Data
+   (including any computations, which must be shown)?
+2. Have I avoided connecting two unrelated prose passages unless the text
+   itself connects them?
 3. Have I removed all raw symbols, internal labels, and citation markers?
-4. If information is missing or partial, have I said so explicitly rather
-   than filling the gap?
-5. Does my answer match the question type (overview vs. specific vs.
-   comparison, etc.) in both content and structure?
+4. If information is missing or partial, have I said so explicitly?
+5. If the question involved tables, figures, comparisons, or a
+   visualization request, have I included a markdown table of the relevant
+   numbers BEFORE my explanation?
+6. Does my answer match the question type in both content and structure?
 
 Only output the final answer — do not show this checklist or your reasoning
 process to the user.
@@ -683,6 +860,19 @@ with st.sidebar:
         st.success("Cache cleared for this chat.")
 
     st.divider()
+    st.header("📊 Table / Image Extraction")
+    if PDFPLUMBER_AVAILABLE:
+        st.success("✅ Table extraction enabled (pdfplumber)")
+    else:
+        st.warning("Table extraction disabled — run `pip install pdfplumber` to enable.")
+    if PYMUPDF_AVAILABLE:
+        st.success("✅ Image extraction enabled (PyMuPDF)")
+    else:
+        st.warning("Image extraction disabled — run `pip install pymupdf` to enable.")
+    if PYMUPDF_AVAILABLE and not OCR_AVAILABLE:
+        st.info("OCR not available — images will be indexed but their text won't be read. Run `pip install pytesseract pillow` (+ install Tesseract binary) to enable.")
+
+    st.divider()
     st.header("🔎 LangSmith Tracing")
     if not LANGSMITH_SDK_AVAILABLE:
         st.warning("`langsmith` package not installed. Run `pip install -U langsmith`.")
@@ -732,21 +922,40 @@ with st.sidebar:
                 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
                 chunks = splitter.split_documents(docs)
 
-                for i, c in enumerate(chunks):
-                    c.metadata["chunk_index"] = i
-                    c.metadata["page"] = c.metadata.get("page", 0) + 1
+                text_items = []
+                for c in chunks:
+                    text_items.append({
+                        "text": c.page_content,
+                        "page": c.metadata.get("page", 0) + 1,
+                        "type": "text",
+                    })
 
-                texts = [c.page_content for c in chunks]
+                if PDFPLUMBER_AVAILABLE:
+                    st.write("🔧 Extracting tables from PDF...")
+                    table_items = extract_tables_as_markdown(tmp_path)
+                else:
+                    table_items = []
+
+                if PYMUPDF_AVAILABLE:
+                    st.write("🔧 Extracting images/figures from PDF...")
+                    image_items = extract_images_with_ocr(tmp_path)
+                else:
+                    image_items = []
+
+                st.write(f"📊 Found {len(table_items)} table(s) and {len(image_items)} image/figure(s).")
+
+                all_items = text_items + table_items + image_items
+                for idx, item in enumerate(all_items):
+                    item["chunk_index"] = idx
+
+                texts = [item["text"] for item in all_items]
 
                 st.write("🔧 Fitting BM25 encoder...")
                 bm25 = BM25Encoder().default()
                 bm25.fit(texts)
                 chat["bm25_encoder"] = bm25
 
-                chat["all_chunks_data"] = [
-                    {"text": c.page_content, "page": c.metadata["page"], "chunk_index": c.metadata["chunk_index"]}
-                    for c in chunks
-                ]
+                chat["all_chunks_data"] = all_items
 
                 st.write("🔧 Connecting to Pinecone...")
                 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -764,15 +973,16 @@ with st.sidebar:
 
                 st.write("🔧 Embedding & upserting chunks into Pinecone...")
                 vectors = []
-                for i, (text, chunk_) in enumerate(zip(texts, chunks)):
-                    dense = embeddings.embed_query(text)
-                    sparse = bm25.encode_documents([text])[0]
+                for i, item in enumerate(all_items):
+                    dense = embeddings.embed_query(item["text"])
+                    sparse = bm25.encode_documents([item["text"]])[0]
                     vectors.append({
                         "id": f"chunk_{i}", "values": dense, "sparse_values": sparse,
                         "metadata": {
-                            "context": text,
-                            "page": chunk_.metadata["page"],
-                            "chunk_index": chunk_.metadata["chunk_index"],
+                            "context": item["text"],
+                            "page": item["page"],
+                            "chunk_index": item["chunk_index"],
+                            "type": item.get("type", "text"),
                             "source": uploaded_file.name
                         }
                     })
@@ -784,7 +994,8 @@ with st.sidebar:
                 chat["doc_name"] = uploaded_file.name
                 if chat["name"].startswith("Chat "):
                     chat["name"] = uploaded_file.name[:30]
-                st.success(f"✅ Document processed! {len(chunks)} chunks indexed.")
+                st.success(f"✅ Document processed! {len(all_items)} chunks indexed "
+                           f"({len(text_items)} text, {len(table_items)} table, {len(image_items)} image).")
 
         except Exception as e:
             st.error(f"Error while processing document: {str(e)}")
@@ -804,7 +1015,7 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Advanced RAG System</p>', unsafe_allow_html=True)
-st.caption("Deterministic • Multi-Hop Retrieval • Leak-Free Synthesis (No Citations) • LangSmith Traced")
+st.caption("Deterministic • Multi-Hop Retrieval • Table/Image Aware • Auto-Visualization • LangSmith Traced")
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
@@ -817,7 +1028,7 @@ for message in chat["chat_history"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-query = st.chat_input("Ask any question about your document...")
+query = st.chat_input("Ask any question about your document (text, tables, or figures)...")
 
 if query:
     chat["chat_history"].append({"role": "user", "content": query})
@@ -826,7 +1037,7 @@ if query:
 
     with st.chat_message("assistant"):
         if query.lower().strip() in ["hi", "hello", "hey"]:
-            resp = "Hello! 👋 Ask me anything about your document — I now guarantee consistent answers."
+            resp = "Hello! 👋 Ask me anything about your document — including tables, figures, comparisons, or trends — and I'll give you a grounded, detailed answer (with a chart when useful)."
             st.markdown(resp)
             chat["chat_history"].append({"role": "assistant", "content": resp})
         else:
@@ -849,6 +1060,20 @@ if query:
                 st.markdown(response)
                 chat["chat_history"].append({"role": "assistant", "content": response})
 
+                # ---- Auto chart rendering when the user asked for comparison/visualization ----
+                if wants_visualization(query):
+                    df = extract_markdown_table(response)
+                    if df is not None and df.shape[1] >= 2 and df.shape[0] >= 2:
+                        try:
+                            chart_df = df.set_index(df.columns[0])
+                            st.markdown("**📊 Visualization:**")
+                            if any(k in query.lower() for k in ["trend", "over time", "timeline"]):
+                                st.line_chart(chart_df)
+                            else:
+                                st.bar_chart(chart_df)
+                        except Exception:
+                            pass
+
                 if debug.get("trace_url"):
                     st.markdown(
                         f"<span class='badge trace-badge'>🔗 <a href='{debug['trace_url']}' target='_blank' style='color:white;'>View trace in LangSmith</a></span>",
@@ -860,7 +1085,7 @@ if query:
                         st.markdown("**Sub-queries used for multi-hop retrieval:**")
                         for sq in debug.get("sub_queries", []):
                             st.write(f"- {sq}")
-                        st.markdown("**Retrieved chunks (page / chunk index / preview):**")
+                        st.markdown("**Retrieved chunks (page / chunk index / type / preview):**")
                         st.json(debug.get("retrieved_pages", []))
                         st.markdown("**Compression scores (score, sentence preview) — for diagnosing empty-context bugs:**")
                         st.json(debug.get("compression_scores", []))
