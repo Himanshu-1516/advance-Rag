@@ -5,6 +5,7 @@ import tempfile
 import uuid
 import re
 import io as io_module
+import base64
 import numpy as np
 import pandas as pd
 import faiss
@@ -19,6 +20,7 @@ except Exception:
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pinecone_text.sparse import BM25Encoder
@@ -39,8 +41,13 @@ except ImportError:
     PYMUPDF_AVAILABLE = False
 
 try:
-    import pytesseract
     from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+try:
+    import pytesseract
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
@@ -51,7 +58,7 @@ try:
     try:
         from langsmith.run_helpers import get_current_run_tree
     except Exception:
-        from langsmith import get_current_run_tree  # fallback for newer SDKs
+        from langsmith import get_current_run_tree
     LANGSMITH_SDK_AVAILABLE = True
 except Exception:
     LANGSMITH_SDK_AVAILABLE = False
@@ -69,6 +76,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "gsk_
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
 GROQ_MODEL = os.getenv("GROQ_MODEL") or st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
+# Vision-capable Groq model, used to actually SEE extracted images/figures.
+# NOTE: Groq's available vision models change over time. If this default
+# starts erroring out, update it in the sidebar (Advanced vision settings)
+# without touching code, or change this default here.
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL") or st.secrets.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or st.secrets.get("LANGSMITH_API_KEY", "")
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT") or st.secrets.get("LANGSMITH_PROJECT", "graph-rag-live-demo")
 LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT") or st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
@@ -77,6 +90,8 @@ KEYS_CONFIGURED = (
     GROQ_API_KEY and "PASTE_YOUR" not in GROQ_API_KEY and
     PINECONE_API_KEY and "PASTE_YOUR" not in PINECONE_API_KEY
 )
+
+VISION_CONFIGURED = bool(KEYS_CONFIGURED)  # same Groq key powers text + vision models
 
 LANGSMITH_CONFIGURED = bool(
     LANGSMITH_SDK_AVAILABLE and LANGSMITH_API_KEY and "PASTE_YOUR" not in LANGSMITH_API_KEY
@@ -91,6 +106,7 @@ st.markdown("""
     .badge {padding: 4px 12px; border-radius: 12px; font-size: 13px; font-weight: bold;}
     .cache-hit {background-color: #22c55e; color: white;}
     .trace-badge {background-color: #6366f1; color: white;}
+    .vision-badge {background-color: #f59e0b; color: white;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -146,12 +162,21 @@ def load_reranker():
 embeddings = load_embeddings()
 reranker = load_reranker()
 
-# ========================= LLM FACTORY (DETERMINISM) =========================
+# ========================= LLM FACTORIES =========================
 def get_llm(deterministic=True):
     return ChatGroq(
         model=GROQ_MODEL,
         api_key=GROQ_API_KEY,
         temperature=0.0 if deterministic else 0.7,
+    )
+
+def get_vision_llm():
+    """Vision-capable Groq model used to actually SEE extracted images."""
+    model_name = st.session_state.get("vision_model_name", GROQ_VISION_MODEL)
+    return ChatGroq(
+        model=model_name,
+        api_key=GROQ_API_KEY,
+        temperature=0.0,
     )
 
 # ========================= LEAKAGE UTILITIES =========================
@@ -166,15 +191,100 @@ def clean_leakage(text):
         cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
-# ========================= TABLE / IMAGE / CAPTION EXTRACTION HELPERS =========================
+def safe_int(x, default=None):
+    try:
+        return int(round(float(x)))
+    except Exception:
+        return default
+
+# ========================= IMAGE HELPERS (RESIZE / ENCODE) =========================
+def resize_image_for_vision(image_bytes, max_dim=1024):
+    """Downscale large images before sending to the vision model — keeps
+    payload size and API latency/cost reasonable without losing readability
+    of charts/text at typical PDF figure resolutions."""
+    if not PIL_AVAILABLE:
+        return image_bytes, "png"
+    try:
+        img = Image.open(io_module.BytesIO(image_bytes)).convert("RGB")
+        w, h = img.size
+        scale = min(1.0, max_dim / max(w, h))
+        if scale < 1.0:
+            img = img.resize((int(w * scale), int(h * scale)))
+        buf = io_module.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue(), "png"
+    except Exception:
+        return image_bytes, "png"
+
+def encode_image_b64(image_bytes):
+    return base64.b64encode(image_bytes).decode("utf-8")
+
+# ========================= VISION MODEL CALLS =========================
+def describe_image_generic(image_b64, image_ext, page, caption_hint=""):
+    """INGESTION-TIME: ask the vision model to produce a rich, searchable
+    description of everything visibly present in the image, so this
+    description can be embedded and retrieved like any other text chunk.
+    This is what makes an image findable at all when a user later asks
+    about 'the sales chart' or 'Figure 1'."""
+    try:
+        llm_vision = get_vision_llm()
+        prompt_text = f"""Describe this image from page {page} of a document in full, factual
+detail for someone who cannot see it. Include: the type of visual (bar chart, line chart,
+pie chart, table-like image, diagram, photo, logo, etc.), any title, axis labels, legend
+entries, every visible numeric data point and what it corresponds to, and any other text
+printed in the image. Be precise with numbers — copy them exactly as shown, do not round
+or estimate. If this is not a data visualization (e.g., a logo or decorative photo), say
+so briefly instead of inventing data.
+{"A caption associated with this image in the document text reads: " + caption_hint if caption_hint else ""}"""
+        message = HumanMessage(content=[
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": f"data:image/{image_ext};base64,{image_b64}"}},
+        ])
+        result = llm_vision.invoke([message])
+        return result.content.strip() if result and result.content else None
+    except Exception:
+        return None
+
+def analyze_image_for_question(image_b64, image_ext, page, user_question, caption_hint=""):
+    """QUERY-TIME: re-examine the ACTUAL image with the user's SPECIFIC
+    question, for a precise, targeted visual answer instead of relying on
+    the generic ingestion-time description. This is the step that lets the
+    assistant answer 'what does the chart on page 4 show' with real detail
+    instead of falling back on a canned refusal."""
+    try:
+        llm_vision = get_vision_llm()
+        prompt_text = f"""You are looking directly at an image extracted from page {page} of a
+document. Answer the user's question using ONLY what is visually present in this image —
+chart type, title, axis labels, legend, every visible numeric data point, trend lines,
+layout/positioning, colors (if relevant to distinguishing categories), and any printed text.
+Be precise with numbers; do not round or estimate. If the image does not contain information
+relevant to the question, say so plainly instead of guessing.
+{"A caption/reference associated with this image reads: " + caption_hint if caption_hint else ""}
+
+User question: {user_question}"""
+        message = HumanMessage(content=[
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": f"data:image/{image_ext};base64,{image_b64}"}},
+        ])
+        result = llm_vision.invoke([message])
+        return result.content.strip() if result and result.content else None
+    except Exception:
+        return None
+
+IMAGE_QUERY_KEYWORDS = ["figure", "fig.", "chart", "image", "diagram", "graph", "visual", "picture", "plot", "layout"]
+FIGURE_REF_REGEX = re.compile(r'\b(figure|fig\.?|table|chart|diagram)\s*\.?\s*(\d+)\b', re.IGNORECASE)
+
+def query_mentions_visual(query):
+    q = query.lower()
+    return any(k in q for k in IMAGE_QUERY_KEYWORDS) or bool(FIGURE_REF_REGEX.search(query))
+
+# ========================= TABLE / CAPTION EXTRACTION HELPERS =========================
 CAPTION_REGEX = re.compile(r'((?:Figure|Fig\.?|Table|Chart|Diagram)\s*\d+[:.\-]?\s*[^\n]{0,220})', re.IGNORECASE)
 
 def extract_page_captions(pdf_path):
-    """Scan each page's actual text layer for figure/table caption lines
-    (e.g. 'Figure 1: AI Agent Market Growth...'). These are usually real,
-    extractable text even when the figure itself is an unreadable image, so
-    they're the most reliable anchor for answering 'what does Figure N show'
-    style questions."""
+    """Scan each page's real text layer for figure/table caption lines —
+    these remain extractable as text even when the figure itself is an
+    unreadable/complex image, and give the vision model grounding context."""
     captions_by_page = {}
     if not PYMUPDF_AVAILABLE:
         return captions_by_page
@@ -190,10 +300,8 @@ def extract_page_captions(pdf_path):
         pass
     return captions_by_page
 
-
 def extract_tables_as_markdown(pdf_path):
-    """Extract tables with row/column structure preserved (as markdown) so the
-    LLM can actually read cells correctly instead of getting jumbled flat text."""
+    """Extract tables with row/column structure preserved (as markdown)."""
     if not PDFPLUMBER_AVAILABLE:
         return []
     table_chunks = []
@@ -224,22 +332,27 @@ def extract_tables_as_markdown(pdf_path):
         pass
     return table_chunks
 
-
-def extract_images_with_ocr(pdf_path, captions_by_page=None):
-    """Pull embedded images and (if OCR available) read any text/labels inside
-    them. Even when OCR fails or is unavailable, attach any figure/table
-    caption found in that page's real text layer — this is the critical fix
-    that lets the LLM answer 'what does this figure show' using the caption
-    and surrounding described data, instead of refusing outright."""
+# ========================= IMAGE EXTRACTION + VISION DESCRIPTION (INGESTION) =========================
+def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True,
+                                 max_vision_images=10, progress_cb=None):
+    """Full ingestion-time image pipeline:
+    Extract images -> (vision model describes it, or OCR fallback) ->
+    return chunks with rich text description PLUS the raw image bytes
+    (base64) kept locally for query-time targeted re-analysis.
+    """
     if not PYMUPDF_AVAILABLE:
         return []
     captions_by_page = captions_by_page or {}
     image_chunks = []
+    vision_calls_used = 0
+
     try:
         doc = fitz.open(pdf_path)
         for page_num in range(len(doc)):
             page = doc[page_num]
             page_caps = captions_by_page.get(page_num + 1, [])
+            caption_text = " | ".join(page_caps)
+
             for img in page.get_images(full=True):
                 xref = img[0]
                 try:
@@ -248,47 +361,58 @@ def extract_images_with_ocr(pdf_path, captions_by_page=None):
                 except Exception:
                     continue
 
+                # Skip tiny images (icons/bullets/decorative dividers) — noise, not content
+                if len(image_bytes) < 3000:
+                    continue
+
+                resized_bytes, ext = resize_image_for_vision(image_bytes)
+                b64 = encode_image_b64(resized_bytes)
+
+                description = None
+                if use_vision and VISION_CONFIGURED and vision_calls_used < max_vision_images:
+                    if progress_cb:
+                        progress_cb(f"🖼️ Vision model analyzing image on page {page_num + 1}...")
+                    description = describe_image_generic(b64, ext, page_num + 1, caption_text)
+                    vision_calls_used += 1
+
                 ocr_text = ""
-                if OCR_AVAILABLE:
+                if not description and OCR_AVAILABLE:
                     try:
                         pil_img = Image.open(io_module.BytesIO(image_bytes))
                         ocr_text = pytesseract.image_to_string(pil_img).strip()
                     except Exception:
                         ocr_text = ""
 
-                caption_hint = f"[FIGURE/IMAGE on page {page_num + 1}]"
-                if ocr_text:
-                    caption_hint += f" Extracted text/labels from the image (via OCR): {ocr_text}"
+                if description:
+                    text_block = f"[FIGURE/IMAGE on page {page_num + 1} — described via direct visual analysis]\n{description}"
+                elif ocr_text:
+                    text_block = f"[FIGURE/IMAGE on page {page_num + 1}] Extracted text/labels via OCR: {ocr_text}"
                 else:
-                    caption_hint += (" No readable text could be extracted directly from the image pixels "
-                                      "(it may be a photo, logo, or a chart whose internal labels are too small/stylized for OCR).")
+                    text_block = (f"[FIGURE/IMAGE on page {page_num + 1}] No readable text or vision "
+                                  f"analysis could be extracted from this image.")
 
-                if page_caps:
-                    caption_hint += (" However, the following caption/reference text was found on the SAME PAGE "
-                                      "in the document's text layer, and should be used to explain what this "
-                                      "figure represents: " + " | ".join(page_caps))
+                if caption_text:
+                    text_block += f"\nCaption/reference found on this page: {caption_text}"
 
                 image_chunks.append({
-                    "text": caption_hint,
+                    "text": text_block,
                     "page": page_num + 1,
                     "type": "image",
+                    "image_b64": b64,          # kept LOCALLY ONLY — never sent to Pinecone metadata
+                    "image_ext": ext,
+                    "caption_text": caption_text,
+                    "vision_described": bool(description),
                 })
         doc.close()
     except Exception:
         pass
     return image_chunks
 
-
 # ========================= KEYWORD-BOOST RETRIEVAL FOR NAMED FIGURES/TABLES =========================
-FIGURE_REF_REGEX = re.compile(r'\b(figure|fig\.?|table|chart|diagram)\s*\.?\s*(\d+)\b', re.IGNORECASE)
-
 def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
-    """If the user explicitly names a figure/table/chart number (e.g. 'Figure 1'),
-    force-include every chunk in the whole document that literally mentions it —
-    captions, references in prose, the image chunk itself, nearby tables — instead
-    of relying solely on embedding/BM25 similarity, which often ranks short
-    captions too low to surface for vague-sounding questions like 'describe the
-    layout of Figure 1'."""
+    """If the user explicitly names a figure/table/chart number, force-include
+    every chunk that literally mentions it, bypassing embedding/BM25 ranking
+    gaps (short captions/figure blocks often rank poorly for vague questions)."""
     matches_needed = FIGURE_REF_REGEX.findall(query)
     if not matches_needed:
         return []
@@ -305,8 +429,7 @@ def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
                     boosted.append(item)
     return boosted[:max_matches]
 
-
-# ========================= VISUALIZATION HELPERS =========================
+# ========================= VISUALIZATION (CHART RENDERING) HELPERS =========================
 VISUAL_KEYWORDS = ["chart", "plot", "visuali", "graph", "trend", "compare", "comparison", "vs", "versus"]
 
 def wants_visualization(query):
@@ -314,7 +437,6 @@ def wants_visualization(query):
     return any(k in q for k in VISUAL_KEYWORDS)
 
 def extract_markdown_table(text):
-    """Parse the first markdown table found in the LLM's response into a DataFrame."""
     lines = [l for l in text.splitlines() if l.strip().startswith("|")]
     if len(lines) < 3:
         return None
@@ -322,7 +444,7 @@ def extract_markdown_table(text):
         table_str = "\n".join(lines)
         df = pd.read_csv(io_module.StringIO(table_str), sep="|", engine="python", skipinitialspace=True)
         df = df.drop(df.columns[[0, -1]], axis=1)
-        df = df.iloc[1:].reset_index(drop=True)  # drop the "---" separator row
+        df = df.iloc[1:].reset_index(drop=True)
         df.columns = [str(c).strip() for c in df.columns]
         for col in df.columns[1:]:
             df[col] = pd.to_numeric(
@@ -333,7 +455,6 @@ def extract_markdown_table(text):
         return df
     except Exception:
         return None
-
 
 # ========================= CLASSES =========================
 class SemanticCache:
@@ -364,7 +485,7 @@ class SemanticCache:
 class AdvancedContextBuilder:
     """Sentence-level dedup + compression for PROSE, with a separate path for
     TABLE and IMAGE chunks (kept intact, ranked as whole blocks — sentence
-    tokenization destroys table rows and scores image captions unfairly low)."""
+    tokenization destroys table rows and unfairly penalizes image/caption blocks)."""
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
@@ -392,7 +513,6 @@ class AdvancedContextBuilder:
                     if len(s.strip()) > 20:
                         sentence_candidates.append({"text": s.strip(), "page": page, "type": "text"})
 
-        # ---- Dedup + rank PROSE sentences ----
         unique_sentences, seen = [], set()
         for item in sentence_candidates:
             key = item["text"].lower()
@@ -416,10 +536,8 @@ class AdvancedContextBuilder:
                 if not filtered_sentences:
                     filtered_sentences = [item for _, item in top_k[:min_sentences_floor]]
 
-        # ---- Rank TABLE / IMAGE blocks as whole units (never sentence-split) ----
         ranked_blocks = []
         if whole_block_candidates:
-            # dedup identical block text first
             seen_blocks = set()
             dedup_blocks = []
             for b in whole_block_candidates:
@@ -453,24 +571,37 @@ class AdvancedContextBuilder:
 # ========================= PARENT/NEIGHBOR EXPANSION =========================
 @traceable(run_type="tool", name="Neighbor Expansion (Parent Document)")
 def expand_with_neighbors(top_docs, all_chunks_data, window=1):
-    """Hierarchical retrieval: pull in the chunk immediately before/after each
-    retrieved chunk so connective tissue between two sections isn't cut off mid-thought."""
+    """Pulls in adjacent chunks for context continuity. CRITICAL: when the
+    matched chunk_index exists locally, we use the FULL local record from
+    all_chunks_data (which carries image_b64/caption_text/etc.) rather than
+    reconstructing a stripped-down dict from Pinecone metadata alone — this
+    is what preserves the actual image bytes needed for query-time vision
+    re-analysis all the way through retrieval."""
     selected = {}
     for doc in top_docs:
-        idx = doc.metadata.get("chunk_index")
+        raw_idx = doc.metadata.get("chunk_index")
+        idx = safe_int(raw_idx)
         page = doc.metadata.get("page", "?")
         item_type = doc.metadata.get("type", "text")
         text = doc.page_content
-        if idx is None:
-            selected[f"raw_{len(selected)}"] = {"text": text, "page": page, "chunk_index": -1, "type": item_type}
-            continue
-        selected[idx] = {"text": text, "page": page, "chunk_index": idx, "type": item_type}
-        for offset in range(1, window + 1):
-            for n_idx in (idx - offset, idx + offset):
-                if 0 <= n_idx < len(all_chunks_data) and n_idx not in selected:
-                    selected[n_idx] = all_chunks_data[n_idx]
 
-    ordered = sorted(selected.values(), key=lambda x: x["chunk_index"] if isinstance(x["chunk_index"], int) else -1)
+        if idx is not None and 0 <= idx < len(all_chunks_data):
+            selected[idx] = all_chunks_data[idx]
+        elif idx is not None:
+            selected[idx] = {"text": text, "page": page, "chunk_index": idx, "type": item_type}
+        else:
+            selected[f"raw_{len(selected)}"] = {"text": text, "page": page, "chunk_index": -1, "type": item_type}
+
+        if idx is not None:
+            for offset in range(1, window + 1):
+                for n_idx in (idx - offset, idx + offset):
+                    if 0 <= n_idx < len(all_chunks_data) and n_idx not in selected:
+                        selected[n_idx] = all_chunks_data[n_idx]
+
+    ordered = sorted(
+        selected.values(),
+        key=lambda x: x["chunk_index"] if isinstance(x.get("chunk_index"), int) else -1
+    )
     return ordered
 
 
@@ -495,7 +626,7 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
     debug = {
         "cache_hit": False, "sub_queries": [], "retrieved_pages": [],
         "compressed_text": "", "final_context": "", "compression_scores": [],
-        "trace_url": None, "keyword_boosted": [],
+        "trace_url": None, "keyword_boosted": [], "vision_analyses": [],
     }
 
     try:
@@ -558,8 +689,6 @@ Question: {query}"""
     retrieved = list(unique_docs.values())
 
     if not retrieved:
-        # Even with zero vector/BM25 hits, a named figure/table might still be
-        # findable via literal keyword match — don't give up yet.
         boosted_only = keyword_boost_chunks(query, chat["all_chunks_data"])
         if not boosted_only:
             return "I don't have enough information in the document to answer that.", debug
@@ -579,8 +708,6 @@ Question: {query}"""
         log("Expanding with neighboring context (parent-document retrieval)...")
         expanded_items = expand_with_neighbors(top_docs, chat["all_chunks_data"], window=1)
 
-        # ---- KEYWORD-BOOST: force-include chunks that literally name a
-        # figure/table the user asked about, even if ranking missed them ----
         log("Checking for explicitly named figures/tables to force-include...")
         boosted = keyword_boost_chunks(query, chat["all_chunks_data"])
         if boosted:
@@ -590,6 +717,27 @@ Question: {query}"""
                     expanded_items.append(b)
                     existing_keys.add(b["text"][:60])
             debug["keyword_boosted"] = [b["text"][:120] for b in boosted]
+
+    # ---- QUERY-TIME TARGETED VISION RE-ANALYSIS ----
+    # If the question is visually oriented AND we have real image bytes for a
+    # candidate figure, re-examine the ACTUAL image with the user's specific
+    # question. This is the step that fixes "no readable text" refusals —
+    # OCR/generic descriptions are a fallback, not the primary answer path.
+    vision_context_blocks = []
+    if VISION_CONFIGURED and st.session_state.get("enable_vision", True) and query_mentions_visual(query):
+        image_candidates = [it for it in expanded_items if it.get("type") == "image" and it.get("image_b64")]
+        for img_item in image_candidates[:3]:
+            log(f"👁️ Running targeted vision analysis on figure (page {img_item.get('page')})...")
+            analysis = analyze_image_for_question(
+                img_item["image_b64"], img_item.get("image_ext", "png"),
+                img_item.get("page"), query, img_item.get("caption_text", "")
+            )
+            if analysis:
+                vision_context_blocks.append(
+                    f"[VISION MODEL ANALYSIS of figure/image on page {img_item.get('page')} — "
+                    f"generated by directly viewing this image to answer the current question]\n{analysis}"
+                )
+    debug["vision_analyses"] = vision_context_blocks
 
     log("Compressing & deduplicating context (tables/images kept intact)...")
     context_builder = AdvancedContextBuilder(reranker)
@@ -605,7 +753,11 @@ Question: {query}"""
         compressed_text = "\n".join(fallback_texts) if fallback_texts else "No relevant context found."
         debug["compressed_text"] = compressed_text
 
-    final_context = "SOURCE PASSAGES:\n" + compressed_text
+    context_pieces = []
+    if vision_context_blocks:
+        context_pieces.append("\n\n".join(vision_context_blocks))
+    context_pieces.append(compressed_text)
+    final_context = "SOURCE PASSAGES:\n" + "\n\n".join(context_pieces)
     debug["final_context"] = final_context
 
     log("Synthesizing final answer...")
@@ -615,11 +767,17 @@ FACTUAL FIDELITY to the provided Context Data. You must never sound confident ab
 something the Context Data does not actually support — but you must also NEVER refuse
 to answer when relevant information genuinely exists somewhere in the Context Data.
 
-The Context Data may contain THREE kinds of content, each marked accordingly:
+The Context Data may contain FOUR kinds of content, each marked accordingly:
 - Plain prose text (no special marker)
 - Tables, marked "[TABLE from page X]" followed by a markdown table
-- Figures/images, marked "[FIGURE/IMAGE on page X]" followed by any OCR'd text
-  and/or any caption/reference text found elsewhere on that same page
+- Figure/image descriptions generated at ingestion time, marked
+  "[FIGURE/IMAGE on page X — described via direct visual analysis]" (or, if
+  vision analysis wasn't available for that image, OCR text or a plain
+  "[FIGURE/IMAGE on page X]" marker with only a caption)
+- Vision model analyses generated specifically for THIS question, marked
+  "[VISION MODEL ANALYSIS of figure/image on page X — generated by directly
+  viewing this image to answer the current question]" — this is the model
+  literally looking at the image right now to answer what was asked.
 
 ====================================================================
 SECTION 1 — CORE GROUNDING PRINCIPLE
@@ -628,12 +786,10 @@ SECTION 1 — CORE GROUNDING PRINCIPLE
 - Use ONLY the information explicitly present in the Context Data below.
 - Do not use outside knowledge, training data, assumptions, or general world
   knowledge about the topic — even if you "know" the correct answer.
-- Do not fill gaps with plausible-sounding information. If the Context Data is
-  silent on something, treat it as unknown, not as something you can reasonably guess.
+- Do not fill gaps with plausible-sounding information.
 - Numbers, dates, names, and figures must be copied or paraphrased exactly as
-  they appear. Never round, estimate, recalculate, or "correct" a number found
-  in the Context Data — except where Section 2B explicitly asks you to compute
-  a derived value (sum, difference, %, etc.) from stated numbers.
+  they appear. Never round, estimate, recalculate, or "correct" a number —
+  except where Section 2B explicitly asks you to compute a derived value.
 
 ====================================================================
 SECTION 2 — CLASSIFY THE QUESTION FIRST (internally, do not show this step)
@@ -648,8 +804,7 @@ SECTION 2 — CLASSIFY THE QUESTION FIRST (internally, do not show this step)
 7. MULTI-PART → address each part separately; state which parts aren't covered.
 
 Also apply Section 2B whenever the question involves tables, figures/images,
-numeric comparisons, calculations, or visualization requests — these layer on
-top of any category above.
+numeric comparisons, calculations, or visualization requests.
 
 ====================================================================
 SECTION 2B — DATA, TABLE & IMAGE REASONING (perform internally, silently)
@@ -659,33 +814,29 @@ A. TABLE-GROUNDED QUESTIONS
    1. Locate every table row/column relevant to the entities in the question.
    2. Extract exact values — never approximate or infer a missing cell.
    3. Compute derived results (difference, sum, %, ranking, trend) yourself
-      from extracted values, and SHOW the numbers used
-      (e.g., "May: 120 units, June: 150 units → +25%").
+      from extracted values, and SHOW the numbers used.
    4. If a needed value is missing from every table, say so explicitly.
    5. Reproduce relevant figures as a compact markdown table when the
       question involves 3+ data points or an explicit comparison.
 
-B. IMAGE / FIGURE-GROUNDED QUESTIONS — CRITICAL RULE:
-   A figure/image entry with "no readable text detected" from OCR means ONLY
-   that the raw pixel content of that specific image could not be read. It
-   does NOT mean you lack information about that figure. Before saying you
-   cannot answer, you MUST:
-     1. Check if a caption or reference to that figure/table number (e.g.
-        "Figure 1: ...") appears anywhere in the Context Data — in the image
-        entry itself, or in nearby prose/table text — and use it.
-     2. Check if the surrounding prose or tables in the Context Data describe
-        the same statistics, trends, or subject matter the figure is about
-        (this is common — text near a chart usually restates or explains its
-        data). If so, use that data to answer the substantive question.
-     3. Only state that you cannot help with the parts that GENUINELY require
-        seeing the image (e.g., exact colors, exact visual layout/positioning,
-        chart type, axis styling) — and clearly separate that limitation from
-        the parts of the question you CAN answer using text/caption/table data.
-   - Never issue a full blanket refusal to a figure-related question just
-     because OCR failed. Partial, clearly-labeled answers are required
-     whenever ANY related information exists elsewhere in the Context Data.
-   - Never invent visual details (colors, shapes, exact chart type) not
-     stated anywhere in the Context Data.
+B. IMAGE / FIGURE-GROUNDED QUESTIONS — CRITICAL RULES:
+   - If a "[VISION MODEL ANALYSIS ...]" block is present for the figure being
+     asked about, treat it as AUTHORITATIVE, DIRECT VISUAL OBSERVATION. You
+     may describe its layout, chart type, axis labels, trends, and every
+     number it reports as established fact — there is no need to hedge about
+     "not being able to see the image," because the vision analysis IS you
+     having looked at it. Answer fully and confidently using that block.
+   - If NO vision analysis block is present for the relevant figure, but a
+     "[FIGURE/IMAGE ... described via direct visual analysis]" block from
+     ingestion exists, use that description the same way — it also came from
+     directly viewing the image.
+   - Only fall back to a limitation statement (e.g., "the exact visual layout
+     of this image isn't available") when NEITHER a vision analysis block NOR
+     a vision-described ingestion block exists for that specific figure —
+     i.e., only plain OCR text or a "no text detected" placeholder is present.
+     Even then, still use any caption or surrounding prose/table data that
+     relates to the same figure before saying anything is unanswerable.
+   - Never invent visual details not stated in any of these blocks.
 
 C. VISUALIZATION REQUESTS ("show me a chart", "visualize this", "plot the
    trend", "graph the comparison")
@@ -694,18 +845,16 @@ C. VISUALIZATION REQUESTS ("show me a chart", "visualize this", "plot the
    - ALWAYS put the data table BEFORE the interpretation.
    - If requested data spans values not present in the Context Data, build
      the table only from what's available and note what's missing.
-   - Never describe a chart in words instead of providing the table.
 
 D. MULTI-STEP ANALYTICAL QUESTIONS (comparisons, trends, calculations
-   spanning multiple data points, tables, or sections)
+   spanning multiple data points, tables, figures, or sections)
    - Steps: (1) identify required data points, (2) locate each in the
-     Context Data, (3) note any missing, (4) compute as needed, (5)
-     synthesize a plain-language conclusion.
-   - Combining individually-stated values from different tables/pages to
-     answer a comparison or calculation IS correct and expected — this is
-     NOT the same as blending unrelated prose claims (Section 3).
+     Context Data (including vision analysis blocks), (3) note any missing,
+     (4) compute as needed, (5) synthesize a plain-language conclusion.
+   - Combining individually-stated values from different tables/figures/pages
+     to answer a comparison or calculation IS correct and expected.
    - Only say data is unavailable when a specific required number is
-     genuinely absent from all retrieved content.
+     genuinely absent from all retrieved content, including vision blocks.
 
 ====================================================================
 SECTION 3 — ANTI-HALLUCINATION SAFEGUARDS
@@ -714,12 +863,11 @@ SECTION 3 — ANTI-HALLUCINATION SAFEGUARDS
 - Never guess a relationship, cause, or connection not explicitly written
   in the Context Data.
 - Never blend two distant, unrelated PROSE claims into one fabricated
-  statement (numeric computation across tables per Section 2B-D is exempt).
-- If the Context Data is ambiguous or contradictory, report that plainly
-  instead of resolving it yourself.
+  statement (numeric computation across tables/figures per Section 2B-D is exempt).
+- If the Context Data is ambiguous or contradictory, report that plainly.
 - Do not extrapolate beyond what is directly stated or directly computable.
 - If a name, number, or term is not explicitly present anywhere in the
-  Context Data, do not introduce it into your answer.
+  Context Data (including vision blocks), do not introduce it.
 
 ====================================================================
 SECTION 4 — HANDLING INSUFFICIENT OR PARTIAL INFORMATION
@@ -727,18 +875,14 @@ SECTION 4 — HANDLING INSUFFICIENT OR PARTIAL INFORMATION
 
 - Full refusal ("I don't have enough information in the document to answer
   that.") is ONLY appropriate when the Context Data contains ABSOLUTELY
-  NOTHING relevant to any part of the question — not even a related caption,
-  statistic, or description of the same topic.
-- If the Context Data contains SOME relevant information — including
-  captions, nearby statistics, or partial table/text data related to a
-  figure — you MUST use it. Provide what is supported, and separately and
-  explicitly state which specific part of the question remains unanswered
-  (e.g., "the document does not let me describe the exact visual layout of
-  this chart, but the surrounding text reports the following figures...").
-- Never treat "the image itself has no OCR text" as equivalent to "there is
-  no relevant information in the Context Data" — check the rest of the
-  context first, every time.
-- Never pad an incomplete answer with speculation to make it feel complete.
+  NOTHING relevant — not even a related caption, vision analysis, statistic,
+  or description of the same topic.
+- If the Context Data contains SOME relevant information, use it. Provide
+  what is supported, and explicitly state which specific part remains
+  unanswered.
+- Never treat "OCR found no text" as equivalent to "no information exists" —
+  check for vision analysis blocks and surrounding context first, every time.
+- Never pad an incomplete answer with speculation.
 
 ====================================================================
 SECTION 5 — OUTPUT FORMATTING RULES
@@ -746,8 +890,7 @@ SECTION 5 — OUTPUT FORMATTING RULES
 
 - Write in clear, natural, professional prose.
 - NEVER output raw internal formatting artifacts: arrows (→), special bullet
-  symbols (•), placeholder labels ("Chunk 1", "Passage A"), internal IDs, or
-  other system-level markers.
+  symbols (•), placeholder labels ("Chunk 1", "Passage A"), internal IDs.
 - Do not include page numbers, section IDs, or citation tags.
 - Plain numbered lists ("1.", "2.") are fine; decorative bullet symbols are not.
 - EXCEPTION — TABLES ARE REQUIRED, NOT LEAKAGE: when comparing 3+ values,
@@ -759,9 +902,9 @@ SECTION 5 — OUTPUT FORMATTING RULES
 SECTION 6 — TONE AND STYLE
 ====================================================================
 
-- Be direct and confident when the Context Data clearly supports the answer.
-- Be transparent when only partially supported — say "the document states..."
-  rather than using absolute certainty language.
+- Be direct and confident when the Context Data (including vision analysis)
+  clearly supports the answer.
+- Be transparent when only partially supported.
 - Avoid filler, over-hedging, or repeating the question.
 - Match answer length/detail to question complexity.
 
@@ -769,8 +912,8 @@ SECTION 6 — TONE AND STYLE
 SECTION 7 — FINAL SELF-CHECK (perform silently before responding)
 ====================================================================
 
-1. Did I check captions and surrounding text/tables before treating a
-   figure/image as unanswerable?
+1. Did I check for a vision analysis block before treating a figure as
+   unanswerable?
 2. Is every claim directly traceable to the Context Data (computations shown)?
 3. Have I avoided connecting unrelated prose passages without textual basis?
 4. Have I removed all raw symbols, internal labels, citation markers?
@@ -832,6 +975,9 @@ if "current_chat_id" not in st.session_state or st.session_state.current_chat_id
 st.session_state.setdefault("deterministic_mode", True)
 st.session_state.setdefault("use_cache", True)
 st.session_state.setdefault("show_debug", True)
+st.session_state.setdefault("enable_vision", True)
+st.session_state.setdefault("vision_model_name", GROQ_VISION_MODEL)
+st.session_state.setdefault("max_vision_images", 10)
 
 # ========================= HELPER =========================
 def wait_for_index_ready(pc, index_name, timeout=90):
@@ -890,17 +1036,38 @@ with st.sidebar:
         st.success("Cache cleared for this chat.")
 
     st.divider()
-    st.header("📊 Table / Image Extraction")
+    st.header("🖼️ Vision Model (Image Understanding)")
+    if PYMUPDF_AVAILABLE and VISION_CONFIGURED:
+        st.success("✅ Vision pipeline available")
+    elif not PYMUPDF_AVAILABLE:
+        st.warning("Install `pymupdf` to enable image extraction: `pip install pymupdf`")
+    else:
+        st.warning("Vision requires a configured GROQ_API_KEY.")
+
+    st.session_state.enable_vision = st.checkbox(
+        "Enable vision-based image understanding",
+        value=st.session_state.enable_vision,
+        help="Uses a multimodal Groq model to actually look at extracted images/figures "
+             "(charts, diagrams) instead of relying only on OCR."
+    )
+    with st.expander("Advanced vision settings"):
+        st.session_state.vision_model_name = st.text_input(
+            "Groq vision model name",
+            value=st.session_state.vision_model_name,
+            help="Must be a vision-capable model currently hosted on Groq. "
+                 "Update this here (no code change needed) if the default gets deprecated."
+        )
+        st.session_state.max_vision_images = st.slider(
+            "Max images to analyze with vision at ingestion", 1, 25, st.session_state.max_vision_images,
+            help="Caps vision API calls during document processing to control cost/time."
+        )
+    if PYMUPDF_AVAILABLE and not OCR_AVAILABLE:
+        st.info("OCR fallback not installed — that's fine as long as vision is enabled. "
+                "Run `pip install pytesseract pillow` (+ Tesseract binary) for an extra fallback layer.")
     if PDFPLUMBER_AVAILABLE:
         st.success("✅ Table extraction enabled (pdfplumber)")
     else:
         st.warning("Table extraction disabled — run `pip install pdfplumber` to enable.")
-    if PYMUPDF_AVAILABLE:
-        st.success("✅ Image + caption extraction enabled (PyMuPDF)")
-    else:
-        st.warning("Image extraction disabled — run `pip install pymupdf` to enable.")
-    if PYMUPDF_AVAILABLE and not OCR_AVAILABLE:
-        st.info("OCR not available — images will still get captions from the text layer, but in-image pixel text won't be read. Run `pip install pytesseract pillow` (+ install Tesseract binary) to enable.")
 
     st.divider()
     st.header("🔎 LangSmith Tracing")
@@ -939,7 +1106,7 @@ with st.sidebar:
     if st.button("Process Document", type="primary", disabled=uploaded_file is None):
         tmp_path = None
         try:
-            with st.spinner("Processing PDF + Building Hybrid Index..."):
+            with st.spinner("Processing PDF + Building Hybrid Index (this may take longer with vision enabled)..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.getvalue())
                     tmp_path = tmp.name
@@ -952,13 +1119,10 @@ with st.sidebar:
                 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
                 chunks = splitter.split_documents(docs)
 
-                text_items = []
-                for c in chunks:
-                    text_items.append({
-                        "text": c.page_content,
-                        "page": c.metadata.get("page", 0) + 1,
-                        "type": "text",
-                    })
+                text_items = [
+                    {"text": c.page_content, "page": c.metadata.get("page", 0) + 1, "type": "text"}
+                    for c in chunks
+                ]
 
                 if PDFPLUMBER_AVAILABLE:
                     st.write("🔧 Extracting tables from PDF...")
@@ -967,16 +1131,22 @@ with st.sidebar:
                     table_items = []
 
                 page_captions = {}
+                image_items = []
                 if PYMUPDF_AVAILABLE:
                     st.write("🔧 Scanning pages for figure/table captions...")
                     page_captions = extract_page_captions(tmp_path)
-                    st.write("🔧 Extracting images/figures from PDF...")
-                    image_items = extract_images_with_ocr(tmp_path, captions_by_page=page_captions)
-                else:
-                    image_items = []
+                    st.write("🔧 Extracting images and running vision analysis...")
+                    image_items = extract_and_describe_images(
+                        tmp_path,
+                        captions_by_page=page_captions,
+                        use_vision=st.session_state.enable_vision,
+                        max_vision_images=st.session_state.max_vision_images,
+                        progress_cb=st.write,
+                    )
 
-                st.write(f"📊 Found {len(table_items)} table(s), {len(image_items)} image/figure(s), "
-                         f"and captions on {len(page_captions)} page(s).")
+                vision_count = sum(1 for it in image_items if it.get("vision_described"))
+                st.write(f"📊 Found {len(table_items)} table(s), {len(image_items)} image/figure(s) "
+                         f"({vision_count} analyzed via vision model), captions on {len(page_captions)} page(s).")
 
                 all_items = text_items + table_items + image_items
                 for idx, item in enumerate(all_items):
@@ -989,7 +1159,7 @@ with st.sidebar:
                 bm25.fit(texts)
                 chat["bm25_encoder"] = bm25
 
-                chat["all_chunks_data"] = all_items
+                chat["all_chunks_data"] = all_items  # local full records (incl. image_b64)
 
                 st.write("🔧 Connecting to Pinecone...")
                 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -1010,6 +1180,9 @@ with st.sidebar:
                 for i, item in enumerate(all_items):
                     dense = embeddings.embed_query(item["text"])
                     sparse = bm25.encode_documents([item["text"]])[0]
+                    # IMPORTANT: never put image_b64 into Pinecone metadata —
+                    # it's large binary-as-text data and unnecessary for
+                    # search; only the text description needs to be indexed.
                     vectors.append({
                         "id": f"chunk_{i}", "values": dense, "sparse_values": sparse,
                         "metadata": {
@@ -1049,7 +1222,7 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Advanced RAG System</p>', unsafe_allow_html=True)
-st.caption("Deterministic • Multi-Hop Retrieval • Table/Image/Caption Aware • Auto-Visualization • LangSmith Traced")
+st.caption("Deterministic • Multi-Hop Retrieval • Vision-Grounded Tables & Figures • Auto-Visualization • LangSmith Traced")
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
@@ -1071,7 +1244,7 @@ if query:
 
     with st.chat_message("assistant"):
         if query.lower().strip() in ["hi", "hello", "hey"]:
-            resp = "Hello! 👋 Ask me anything about your document — including tables, figures, comparisons, or trends — and I'll give you a grounded, detailed answer (with a chart when useful)."
+            resp = "Hello! 👋 Ask me anything about your document — including tables, figures, comparisons, or trends — and I'll give you a grounded, detailed answer (with vision analysis and charts when useful)."
             st.markdown(resp)
             chat["chat_history"].append({"role": "assistant", "content": resp})
         else:
@@ -1090,11 +1263,15 @@ if query:
                         f"<span class='badge cache-hit'>⚡ CACHE HIT ({debug['similarity']:.2f})</span><br><br>",
                         unsafe_allow_html=True
                     )
+                if debug.get("vision_analyses"):
+                    st.markdown(
+                        "<span class='badge vision-badge'>👁️ Vision model analyzed an image for this answer</span><br><br>",
+                        unsafe_allow_html=True
+                    )
 
                 st.markdown(response)
                 chat["chat_history"].append({"role": "assistant", "content": response})
 
-                # ---- Auto chart rendering when the user asked for comparison/visualization ----
                 if wants_visualization(query):
                     df = extract_markdown_table(response)
                     if df is not None and df.shape[1] >= 2 and df.shape[0] >= 2:
@@ -1122,9 +1299,13 @@ if query:
                         st.markdown("**Retrieved chunks (page / chunk index / type / preview):**")
                         st.json(debug.get("retrieved_pages", []))
                         if debug.get("keyword_boosted"):
-                            st.markdown("**Force-included via keyword boost (explicit Figure/Table N reference in query):**")
+                            st.markdown("**Force-included via keyword boost (explicit Figure/Table N reference):**")
                             st.json(debug.get("keyword_boosted", []))
-                        st.markdown("**Compression scores (score, sentence preview) — for diagnosing empty-context bugs:**")
+                        if debug.get("vision_analyses"):
+                            st.markdown("**🖼️ Live vision model analysis performed for this question:**")
+                            for va in debug["vision_analyses"]:
+                                st.text(va)
+                        st.markdown("**Compression scores (score, sentence preview):**")
                         st.json(debug.get("compression_scores", []))
                         st.markdown("**Compressed context sent to the LLM:**")
                         st.write(debug.get("compressed_text", ""))
@@ -1138,9 +1319,8 @@ if query:
 st.divider()
 with st.expander("🧪 Evaluation Harness — Consistency Testing"):
     st.caption(
-        "Run the same questions multiple times to verify determinism and detect drift — "
-        "without doing it manually every time. Every run is also traced to LangSmith "
-        "(if enabled) under the `deterministic` / `sampled` tags for later inspection."
+        "Run the same questions multiple times to verify determinism and detect drift. "
+        "Every run is also traced to LangSmith (if enabled) under `deterministic`/`sampled` tags."
     )
     default_qs = "What is the main topic of this document?\nHow does the first major concept connect to the last one discussed?"
     test_qs_raw = st.text_area("Test questions (one per line)", value=default_qs, height=120,
