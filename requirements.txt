@@ -11,3 +11,8 @@ langchain-text-splitters
 pypdf
 pinecone
 pinecone-text
+pdfplumber
+pymupdf 
+pytesseract 
+pillow 
+pandas
