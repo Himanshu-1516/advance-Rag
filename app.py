@@ -166,7 +166,31 @@ def clean_leakage(text):
         cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
-# ========================= TABLE / IMAGE EXTRACTION HELPERS =========================
+# ========================= TABLE / IMAGE / CAPTION EXTRACTION HELPERS =========================
+CAPTION_REGEX = re.compile(r'((?:Figure|Fig\.?|Table|Chart|Diagram)\s*\d+[:.\-]?\s*[^\n]{0,220})', re.IGNORECASE)
+
+def extract_page_captions(pdf_path):
+    """Scan each page's actual text layer for figure/table caption lines
+    (e.g. 'Figure 1: AI Agent Market Growth...'). These are usually real,
+    extractable text even when the figure itself is an unreadable image, so
+    they're the most reliable anchor for answering 'what does Figure N show'
+    style questions."""
+    captions_by_page = {}
+    if not PYMUPDF_AVAILABLE:
+        return captions_by_page
+    try:
+        doc = fitz.open(pdf_path)
+        for page_num in range(len(doc)):
+            text = doc[page_num].get_text()
+            found = CAPTION_REGEX.findall(text)
+            if found:
+                captions_by_page[page_num + 1] = [f.strip() for f in found]
+        doc.close()
+    except Exception:
+        pass
+    return captions_by_page
+
+
 def extract_tables_as_markdown(pdf_path):
     """Extract tables with row/column structure preserved (as markdown) so the
     LLM can actually read cells correctly instead of getting jumbled flat text."""
@@ -201,17 +225,21 @@ def extract_tables_as_markdown(pdf_path):
     return table_chunks
 
 
-def extract_images_with_ocr(pdf_path):
+def extract_images_with_ocr(pdf_path, captions_by_page=None):
     """Pull embedded images and (if OCR available) read any text/labels inside
-    them — axis labels, chart titles, figure captions — so images aren't
-    completely invisible to the retrieval pipeline."""
+    them. Even when OCR fails or is unavailable, attach any figure/table
+    caption found in that page's real text layer — this is the critical fix
+    that lets the LLM answer 'what does this figure show' using the caption
+    and surrounding described data, instead of refusing outright."""
     if not PYMUPDF_AVAILABLE:
         return []
+    captions_by_page = captions_by_page or {}
     image_chunks = []
     try:
         doc = fitz.open(pdf_path)
         for page_num in range(len(doc)):
             page = doc[page_num]
+            page_caps = captions_by_page.get(page_num + 1, [])
             for img in page.get_images(full=True):
                 xref = img[0]
                 try:
@@ -230,9 +258,15 @@ def extract_images_with_ocr(pdf_path):
 
                 caption_hint = f"[FIGURE/IMAGE on page {page_num + 1}]"
                 if ocr_text:
-                    caption_hint += f" Extracted text/labels from the image: {ocr_text}"
+                    caption_hint += f" Extracted text/labels from the image (via OCR): {ocr_text}"
                 else:
-                    caption_hint += " (No readable text detected in this image — likely a photo, logo, or unlabeled chart.)"
+                    caption_hint += (" No readable text could be extracted directly from the image pixels "
+                                      "(it may be a photo, logo, or a chart whose internal labels are too small/stylized for OCR).")
+
+                if page_caps:
+                    caption_hint += (" However, the following caption/reference text was found on the SAME PAGE "
+                                      "in the document's text layer, and should be used to explain what this "
+                                      "figure represents: " + " | ".join(page_caps))
 
                 image_chunks.append({
                     "text": caption_hint,
@@ -243,6 +277,33 @@ def extract_images_with_ocr(pdf_path):
     except Exception:
         pass
     return image_chunks
+
+
+# ========================= KEYWORD-BOOST RETRIEVAL FOR NAMED FIGURES/TABLES =========================
+FIGURE_REF_REGEX = re.compile(r'\b(figure|fig\.?|table|chart|diagram)\s*\.?\s*(\d+)\b', re.IGNORECASE)
+
+def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
+    """If the user explicitly names a figure/table/chart number (e.g. 'Figure 1'),
+    force-include every chunk in the whole document that literally mentions it —
+    captions, references in prose, the image chunk itself, nearby tables — instead
+    of relying solely on embedding/BM25 similarity, which often ranks short
+    captions too low to surface for vague-sounding questions like 'describe the
+    layout of Figure 1'."""
+    matches_needed = FIGURE_REF_REGEX.findall(query)
+    if not matches_needed:
+        return []
+
+    boosted = []
+    seen = set()
+    for label, num in matches_needed:
+        pattern = re.compile(rf'{re.escape(label)}\.?\s*{re.escape(num)}\b', re.IGNORECASE)
+        for item in all_chunks_data:
+            if pattern.search(item["text"]):
+                key = item["text"][:60]
+                if key not in seen:
+                    seen.add(key)
+                    boosted.append(item)
+    return boosted[:max_matches]
 
 
 # ========================= VISUALIZATION HELPERS =========================
@@ -302,17 +363,8 @@ class SemanticCache:
 
 class AdvancedContextBuilder:
     """Sentence-level dedup + compression for PROSE, with a separate path for
-    TABLE and IMAGE chunks.
-
-    IMPORTANT FIX: Tables/images must NOT be run through nltk.sent_tokenize().
-    A markdown table row like "| May | 120 |" is not a sentence — tokenizing
-    it destroys row/column alignment and the cross-encoder scores fragments
-    of a table far below full prose sentences (out-of-distribution input for
-    a sentence-relevance model), causing tables to be silently dropped from
-    context even when directly relevant. Instead, table/image chunks are kept
-    fully intact and ranked as whole blocks against the query, then combined
-    back into the final context alongside the compressed prose.
-    """
+    TABLE and IMAGE chunks (kept intact, ranked as whole blocks — sentence
+    tokenization destroys table rows and scores image captions unfairly low)."""
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
@@ -324,7 +376,7 @@ class AdvancedContextBuilder:
         max_sentences=22,
         relative_gap=4.0,
         min_sentences_floor=3,
-        max_blocks=5,
+        max_blocks=6,
         debug_scores=False,
     ):
         sentence_candidates = []
@@ -364,12 +416,21 @@ class AdvancedContextBuilder:
                 if not filtered_sentences:
                     filtered_sentences = [item for _, item in top_k[:min_sentences_floor]]
 
-        # ---- Rank TABLE / IMAGE blocks as whole units ----
+        # ---- Rank TABLE / IMAGE blocks as whole units (never sentence-split) ----
         ranked_blocks = []
         if whole_block_candidates:
-            block_pairs = [[query, b["text"][:2000]] for b in whole_block_candidates]
+            # dedup identical block text first
+            seen_blocks = set()
+            dedup_blocks = []
+            for b in whole_block_candidates:
+                key = b["text"][:80]
+                if key not in seen_blocks:
+                    seen_blocks.add(key)
+                    dedup_blocks.append(b)
+
+            block_pairs = [[query, b["text"][:2000]] for b in dedup_blocks]
             block_scores = self.reranker.predict(block_pairs)
-            ranked_full = sorted(zip(block_scores, whole_block_candidates), key=lambda x: x[0], reverse=True)
+            ranked_full = sorted(zip(block_scores, dedup_blocks), key=lambda x: x[0], reverse=True)
             top_blocks = ranked_full[:max_blocks]
             if top_blocks:
                 best_block_score = top_blocks[0][0]
@@ -434,7 +495,7 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
     debug = {
         "cache_hit": False, "sub_queries": [], "retrieved_pages": [],
         "compressed_text": "", "final_context": "", "compression_scores": [],
-        "trace_url": None,
+        "trace_url": None, "keyword_boosted": [],
     }
 
     try:
@@ -497,20 +558,38 @@ Question: {query}"""
     retrieved = list(unique_docs.values())
 
     if not retrieved:
-        return "I don't have enough information in the document to answer that.", debug
+        # Even with zero vector/BM25 hits, a named figure/table might still be
+        # findable via literal keyword match — don't give up yet.
+        boosted_only = keyword_boost_chunks(query, chat["all_chunks_data"])
+        if not boosted_only:
+            return "I don't have enough information in the document to answer that.", debug
+        expanded_items = boosted_only
+        debug["keyword_boosted"] = [b["text"][:120] for b in boosted_only]
+    else:
+        log("Reranking with cross-encoder...")
+        doc_texts = [doc.page_content for doc in retrieved]
+        scores = reranker.predict([[query, t] for t in doc_texts])
+        top_docs = [d for _, d in sorted(zip(scores, retrieved), key=lambda x: x[0], reverse=True)[:8]]
 
-    log("Reranking with cross-encoder...")
-    doc_texts = [doc.page_content for doc in retrieved]
-    scores = reranker.predict([[query, t] for t in doc_texts])
-    top_docs = [d for _, d in sorted(zip(scores, retrieved), key=lambda x: x[0], reverse=True)[:8]]
+        debug["retrieved_pages"] = [
+            {"page": d.metadata.get("page", "?"), "chunk_index": d.metadata.get("chunk_index", "?"),
+             "type": d.metadata.get("type", "text"), "preview": d.page_content[:120] + "..."} for d in top_docs
+        ]
 
-    debug["retrieved_pages"] = [
-        {"page": d.metadata.get("page", "?"), "chunk_index": d.metadata.get("chunk_index", "?"),
-         "type": d.metadata.get("type", "text"), "preview": d.page_content[:120] + "..."} for d in top_docs
-    ]
+        log("Expanding with neighboring context (parent-document retrieval)...")
+        expanded_items = expand_with_neighbors(top_docs, chat["all_chunks_data"], window=1)
 
-    log("Expanding with neighboring context (parent-document retrieval)...")
-    expanded_items = expand_with_neighbors(top_docs, chat["all_chunks_data"], window=1)
+        # ---- KEYWORD-BOOST: force-include chunks that literally name a
+        # figure/table the user asked about, even if ranking missed them ----
+        log("Checking for explicitly named figures/tables to force-include...")
+        boosted = keyword_boost_chunks(query, chat["all_chunks_data"])
+        if boosted:
+            existing_keys = {item["text"][:60] for item in expanded_items}
+            for b in boosted:
+                if b["text"][:60] not in existing_keys:
+                    expanded_items.append(b)
+                    existing_keys.add(b["text"][:60])
+            debug["keyword_boosted"] = [b["text"][:120] for b in boosted]
 
     log("Compressing & deduplicating context (tables/images kept intact)...")
     context_builder = AdvancedContextBuilder(reranker)
@@ -533,13 +612,14 @@ Question: {query}"""
     final_prompt = f"""You are a precise, document-grounded analytical assistant used in a
 production question-answering system. Your single most important responsibility is
 FACTUAL FIDELITY to the provided Context Data. You must never sound confident about
-something the Context Data does not actually support.
+something the Context Data does not actually support — but you must also NEVER refuse
+to answer when relevant information genuinely exists somewhere in the Context Data.
 
 The Context Data may contain THREE kinds of content, each marked accordingly:
 - Plain prose text (no special marker)
 - Tables, marked "[TABLE from page X]" followed by a markdown table
-- Figures/images, marked "[FIGURE/IMAGE from page X]" followed by any extracted
-  text/labels found inside that image (or a note that no text was detected)
+- Figures/images, marked "[FIGURE/IMAGE on page X]" followed by any OCR'd text
+  and/or any caption/reference text found elsewhere on that same page
 
 ====================================================================
 SECTION 1 — CORE GROUNDING PRINCIPLE
@@ -550,9 +630,6 @@ SECTION 1 — CORE GROUNDING PRINCIPLE
   knowledge about the topic — even if you "know" the correct answer.
 - Do not fill gaps with plausible-sounding information. If the Context Data is
   silent on something, treat it as unknown, not as something you can reasonably guess.
-- If the Context Data contains multiple documents, tables, or chunks, treat each
-  as a separate source of truth. Do not assume two chunks are related just because
-  they appear near each other or share a keyword.
 - Numbers, dates, names, and figures must be copied or paraphrased exactly as
   they appear. Never round, estimate, recalculate, or "correct" a number found
   in the Context Data — except where Section 2B explicitly asks you to compute
@@ -562,102 +639,71 @@ SECTION 1 — CORE GROUNDING PRINCIPLE
 SECTION 2 — CLASSIFY THE QUESTION FIRST (internally, do not show this step)
 ====================================================================
 
-Before answering, silently determine which category the question falls into:
+1. OVERVIEW / SUMMARY → synthesize themes across the entire Context Data.
+2. SPECIFIC FACTUAL → answer from the single most relevant passage/table/figure.
+3. RELATIONSHIP / CAUSAL → only state a relationship if explicitly described.
+4. LIST / ENUMERATION → extract all explicitly stated relevant items only.
+5. COMPARISON → only compare attributes explicitly stated for both items.
+6. YES/NO or VERIFICATION → answer directly, then support with a paraphrase.
+7. MULTI-PART → address each part separately; state which parts aren't covered.
 
-1. OVERVIEW / SUMMARY
-   → Synthesize themes and main subjects across the entire Context Data,
-     including what tables/figures are present. Prioritize breadth and
-     structure over exhaustive detail.
-
-2. SPECIFIC FACTUAL
-   → Answer using the single most relevant passage, table row, or figure.
-     Do NOT merge details from unrelated passages unless explicitly connected.
-     If sources conflict, report both and note the conflict.
-
-3. RELATIONSHIP / CAUSAL
-   → Only state a relationship if explicitly described in the text (using
-     language like "causes," "leads to," "results in," "because," etc.).
-     Otherwise say no explicit relationship is stated.
-
-4. LIST / ENUMERATION
-   → Extract all explicitly stated relevant items. Do not invent items to
-     make a list feel complete.
-
-5. COMPARISON
-   → Only compare attributes explicitly stated for both items being compared.
-     If data exists for only one side, say so explicitly.
-
-6. YES/NO or VERIFICATION
-   → Answer directly (yes/no/not stated), then support with a brief
-     paraphrase of the relevant passage or data.
-
-7. MULTI-PART
-   → Address each part separately. If only some parts are covered, answer
-     those and clearly state which parts are not covered.
-
-Note: In addition to the categories above, also apply Section 2B whenever the
-question involves tables, figures/images, numeric comparisons, calculations,
-or a request to "visualize"/"chart"/"plot" something — these can layer on
-top of any category above (e.g., a COMPARISON question about a sales table).
+Also apply Section 2B whenever the question involves tables, figures/images,
+numeric comparisons, calculations, or visualization requests — these layer on
+top of any category above.
 
 ====================================================================
 SECTION 2B — DATA, TABLE & IMAGE REASONING (perform internally, silently)
 ====================================================================
 
-A. TABLE-GROUNDED QUESTIONS (asking about specific rows, columns, time
-   periods, categories, or values that live inside a table)
-   Step 1 — Locate: Identify every table row/column in the Context Data
-     relevant to the entities in the question (e.g., specific months,
-     products, regions, categories).
-   Step 2 — Extract: Pull the exact values for each relevant row/column.
-     Do not approximate or infer a value that isn't explicitly in a cell.
-   Step 3 — Compute (if asked): If the question requires a derived result —
-     difference, sum, average, percentage change, ranking, trend — perform
-     the calculation yourself using only the extracted values, and show the
-     numbers you used (e.g., "May: 120 units, June: 150 units → an increase
-     of 30 units, or 25%"). Never state a computed result without showing
-     the figures behind it.
-   Step 4 — If a needed value is missing from every table in the Context
-     Data, say so explicitly rather than estimating it.
-   Step 5 — Present: Report the extracted values and reasoning in plain
-     prose, AND reproduce the relevant figures as a compact markdown table
-     when the question involves 3+ data points or an explicit comparison —
-     this lets the interface render an actual chart from it.
+A. TABLE-GROUNDED QUESTIONS
+   1. Locate every table row/column relevant to the entities in the question.
+   2. Extract exact values — never approximate or infer a missing cell.
+   3. Compute derived results (difference, sum, %, ranking, trend) yourself
+      from extracted values, and SHOW the numbers used
+      (e.g., "May: 120 units, June: 150 units → +25%").
+   4. If a needed value is missing from every table, say so explicitly.
+   5. Reproduce relevant figures as a compact markdown table when the
+      question involves 3+ data points or an explicit comparison.
 
-B. IMAGE / FIGURE-GROUNDED QUESTIONS (e.g., "what does the chart on page 4
-   show", "describe the diagram", "what does the image say")
-   - Use only the OCR'd text/labels or caption text provided for that image.
-   - If the image entry indicates no readable text was detected, plainly
-     tell the user the document contains an image there but its content
-     could not be extracted as text — do not guess what it depicts.
-   - Never invent visual details (colors, shapes, chart type) not stated in
-     the extracted text.
+B. IMAGE / FIGURE-GROUNDED QUESTIONS — CRITICAL RULE:
+   A figure/image entry with "no readable text detected" from OCR means ONLY
+   that the raw pixel content of that specific image could not be read. It
+   does NOT mean you lack information about that figure. Before saying you
+   cannot answer, you MUST:
+     1. Check if a caption or reference to that figure/table number (e.g.
+        "Figure 1: ...") appears anywhere in the Context Data — in the image
+        entry itself, or in nearby prose/table text — and use it.
+     2. Check if the surrounding prose or tables in the Context Data describe
+        the same statistics, trends, or subject matter the figure is about
+        (this is common — text near a chart usually restates or explains its
+        data). If so, use that data to answer the substantive question.
+     3. Only state that you cannot help with the parts that GENUINELY require
+        seeing the image (e.g., exact colors, exact visual layout/positioning,
+        chart type, axis styling) — and clearly separate that limitation from
+        the parts of the question you CAN answer using text/caption/table data.
+   - Never issue a full blanket refusal to a figure-related question just
+     because OCR failed. Partial, clearly-labeled answers are required
+     whenever ANY related information exists elsewhere in the Context Data.
+   - Never invent visual details (colors, shapes, exact chart type) not
+     stated anywhere in the Context Data.
 
-C. VISUALIZATION REQUESTS (e.g., "show me a chart", "visualize this",
-   "plot the trend", "graph the comparison")
-   - You cannot render an actual image, so produce the most chart-ready
-     structured representation of the requested data as a markdown table
-     (clear numeric columns), followed by a short written interpretation
-     of the pattern (trend, comparison, spike, decline, etc.).
-   - ALWAYS put the raw data table BEFORE the interpretation, so the
-     surrounding application can detect and render it as a real chart.
+C. VISUALIZATION REQUESTS ("show me a chart", "visualize this", "plot the
+   trend", "graph the comparison")
+   - Produce the most chart-ready markdown table of the requested data,
+     followed by a short written interpretation of the pattern.
+   - ALWAYS put the data table BEFORE the interpretation.
    - If requested data spans values not present in the Context Data, build
-     the table only from what is available and explicitly note what's missing.
+     the table only from what's available and note what's missing.
    - Never describe a chart in words instead of providing the table.
 
 D. MULTI-STEP ANALYTICAL QUESTIONS (comparisons, trends, calculations
    spanning multiple data points, tables, or sections)
-   - Break the task into explicit internal steps: (1) identify what data
-     points are required, (2) locate each in the Context Data, (3) note any
-     that are missing, (4) perform any necessary computation, (5) synthesize
-     a plain-language conclusion.
-   - Never refuse a comparison/calculation just because the numbers live in
-     different tables, rows, or pages — as long as each individual value is
-     explicitly present somewhere in the Context Data, combining them to
-     answer the question IS correct and expected. This is different from
-     Section 3's rule against blending unrelated prose passages: numeric
-     extraction-and-computation across tables is a legitimate, expected
-     operation, not hallucination.
+   - Steps: (1) identify required data points, (2) locate each in the
+     Context Data, (3) note any missing, (4) compute as needed, (5)
+     synthesize a plain-language conclusion.
+   - Combining individually-stated values from different tables/pages to
+     answer a comparison or calculation IS correct and expected — this is
+     NOT the same as blending unrelated prose claims (Section 3).
    - Only say data is unavailable when a specific required number is
      genuinely absent from all retrieved content.
 
@@ -666,90 +712,74 @@ SECTION 3 — ANTI-HALLUCINATION SAFEGUARDS
 ====================================================================
 
 - Never guess a relationship, cause, or connection not explicitly written
-  in the Context Data, even if it seems logical or likely.
-- Never blend two distant or unrelated PROSE passages into a single
-  fabricated claim (this rule does not restrict legitimate numeric
-  computation across tables per Section 2B-D).
-- If the Context Data is ambiguous, report the ambiguity rather than
-  resolving it with an assumption.
-- If the Context Data contains contradictory statements, present both
-  neutrally instead of choosing one as correct.
-- Do not extrapolate trends, implications, or conclusions beyond what is
-  directly stated or directly computable from stated numbers.
-- Do not add caveats, disclaimers, or "in general" statements not grounded
   in the Context Data.
-- If a name, number, or term is not explicitly present in the Context Data,
-  do not introduce it into your answer under any circumstance.
+- Never blend two distant, unrelated PROSE claims into one fabricated
+  statement (numeric computation across tables per Section 2B-D is exempt).
+- If the Context Data is ambiguous or contradictory, report that plainly
+  instead of resolving it yourself.
+- Do not extrapolate beyond what is directly stated or directly computable.
+- If a name, number, or term is not explicitly present anywhere in the
+  Context Data, do not introduce it into your answer.
 
 ====================================================================
 SECTION 4 — HANDLING INSUFFICIENT OR PARTIAL INFORMATION
 ====================================================================
 
-- If the Context Data contains NOTHING relevant to the question, respond
-  exactly with:
-  "I don't have enough information in the document to answer that."
-- If the Context Data contains SOME relevant information but not a complete
-  answer, do NOT refuse. Instead:
-  1. Provide what is explicitly supported (including any usable table/figure data).
-  2. Clearly state which part of the question is not addressed.
-- Never treat partial coverage as equivalent to no coverage.
+- Full refusal ("I don't have enough information in the document to answer
+  that.") is ONLY appropriate when the Context Data contains ABSOLUTELY
+  NOTHING relevant to any part of the question — not even a related caption,
+  statistic, or description of the same topic.
+- If the Context Data contains SOME relevant information — including
+  captions, nearby statistics, or partial table/text data related to a
+  figure — you MUST use it. Provide what is supported, and separately and
+  explicitly state which specific part of the question remains unanswered
+  (e.g., "the document does not let me describe the exact visual layout of
+  this chart, but the surrounding text reports the following figures...").
+- Never treat "the image itself has no OCR text" as equivalent to "there is
+  no relevant information in the Context Data" — check the rest of the
+  context first, every time.
 - Never pad an incomplete answer with speculation to make it feel complete.
 
 ====================================================================
 SECTION 5 — OUTPUT FORMATTING RULES
 ====================================================================
 
-- Write in clear, natural, professional prose — as if explaining to a
-  colleague, not presenting raw extracted data.
-- NEVER output raw internal formatting artifacts, including but not limited
-  to: arrows (→), bullets rendered as special symbols (•), placeholder labels
-  like "Entity1/Entity2," "Chunk 1," "Passage A," internal IDs, or any other
-  system-level markers.
-- Do not include page numbers, section IDs, footnote markers, or citation
-  tags in the answer.
-- You may use plain paragraph structure or simple numbered/lettered lists
-  (using normal text, e.g., "1.", "2.") when listing multiple items, but do
-  not use decorative bullet symbols.
-- EXCEPTION — TABLES ARE REQUIRED OUTPUT, NOT LEAKAGE: When the answer
-  involves comparing 3+ values, numeric trends, or an explicit chart/
-  visualization/comparison request, you MUST include a compact, clean
-  markdown table of the relevant figures BEFORE your written explanation.
-  Use standard markdown table syntax (| Column | Column |) so it can be
-  parsed and rendered as a chart by the application.
-- Keep formatting consistent with a finished, human-written document aside
-  from the table exception above — no visible traces of the retrieval or
-  context-assembly process.
+- Write in clear, natural, professional prose.
+- NEVER output raw internal formatting artifacts: arrows (→), special bullet
+  symbols (•), placeholder labels ("Chunk 1", "Passage A"), internal IDs, or
+  other system-level markers.
+- Do not include page numbers, section IDs, or citation tags.
+- Plain numbered lists ("1.", "2.") are fine; decorative bullet symbols are not.
+- EXCEPTION — TABLES ARE REQUIRED, NOT LEAKAGE: when comparing 3+ values,
+  numeric trends, or responding to a chart/visualization/comparison request,
+  include a clean markdown table of the relevant figures BEFORE your written
+  explanation, using standard `| Column | Column |` syntax.
 
 ====================================================================
 SECTION 6 — TONE AND STYLE
 ====================================================================
 
 - Be direct and confident when the Context Data clearly supports the answer.
-- Be transparent and measured when the Context Data only partially supports
-  the answer — use phrases like "the document states..." or "according to the
-  provided data..." rather than absolute certainty language when the source
-  itself is limited or vague.
-- Avoid filler phrases, over-hedging, or unnecessary repetition of the question.
-- Match the length of the answer to the complexity of the question.
+- Be transparent when only partially supported — say "the document states..."
+  rather than using absolute certainty language.
+- Avoid filler, over-hedging, or repeating the question.
+- Match answer length/detail to question complexity.
 
 ====================================================================
 SECTION 7 — FINAL SELF-CHECK (perform silently before responding)
 ====================================================================
 
-Before finalizing your answer, verify internally:
-1. Is every claim in my answer directly traceable to the Context Data
-   (including any computations, which must be shown)?
-2. Have I avoided connecting two unrelated prose passages unless the text
-   itself connects them?
-3. Have I removed all raw symbols, internal labels, and citation markers?
-4. If information is missing or partial, have I said so explicitly?
-5. If the question involved tables, figures, comparisons, or a
-   visualization request, have I included a markdown table of the relevant
-   numbers BEFORE my explanation?
-6. Does my answer match the question type in both content and structure?
+1. Did I check captions and surrounding text/tables before treating a
+   figure/image as unanswerable?
+2. Is every claim directly traceable to the Context Data (computations shown)?
+3. Have I avoided connecting unrelated prose passages without textual basis?
+4. Have I removed all raw symbols, internal labels, citation markers?
+5. If something is missing, have I said so explicitly rather than refusing
+   the whole question?
+6. If tables/figures/comparisons/visualization were involved, did I include
+   a markdown table before my explanation?
 
-Only output the final answer — do not show this checklist or your reasoning
-process to the user.
+Only output the final answer — never show this checklist to the user.
 
 ====================================================================
 QUESTION
@@ -866,11 +896,11 @@ with st.sidebar:
     else:
         st.warning("Table extraction disabled — run `pip install pdfplumber` to enable.")
     if PYMUPDF_AVAILABLE:
-        st.success("✅ Image extraction enabled (PyMuPDF)")
+        st.success("✅ Image + caption extraction enabled (PyMuPDF)")
     else:
         st.warning("Image extraction disabled — run `pip install pymupdf` to enable.")
     if PYMUPDF_AVAILABLE and not OCR_AVAILABLE:
-        st.info("OCR not available — images will be indexed but their text won't be read. Run `pip install pytesseract pillow` (+ install Tesseract binary) to enable.")
+        st.info("OCR not available — images will still get captions from the text layer, but in-image pixel text won't be read. Run `pip install pytesseract pillow` (+ install Tesseract binary) to enable.")
 
     st.divider()
     st.header("🔎 LangSmith Tracing")
@@ -936,13 +966,17 @@ with st.sidebar:
                 else:
                     table_items = []
 
+                page_captions = {}
                 if PYMUPDF_AVAILABLE:
+                    st.write("🔧 Scanning pages for figure/table captions...")
+                    page_captions = extract_page_captions(tmp_path)
                     st.write("🔧 Extracting images/figures from PDF...")
-                    image_items = extract_images_with_ocr(tmp_path)
+                    image_items = extract_images_with_ocr(tmp_path, captions_by_page=page_captions)
                 else:
                     image_items = []
 
-                st.write(f"📊 Found {len(table_items)} table(s) and {len(image_items)} image/figure(s).")
+                st.write(f"📊 Found {len(table_items)} table(s), {len(image_items)} image/figure(s), "
+                         f"and captions on {len(page_captions)} page(s).")
 
                 all_items = text_items + table_items + image_items
                 for idx, item in enumerate(all_items):
@@ -1015,7 +1049,7 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Advanced RAG System</p>', unsafe_allow_html=True)
-st.caption("Deterministic • Multi-Hop Retrieval • Table/Image Aware • Auto-Visualization • LangSmith Traced")
+st.caption("Deterministic • Multi-Hop Retrieval • Table/Image/Caption Aware • Auto-Visualization • LangSmith Traced")
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
@@ -1087,6 +1121,9 @@ if query:
                             st.write(f"- {sq}")
                         st.markdown("**Retrieved chunks (page / chunk index / type / preview):**")
                         st.json(debug.get("retrieved_pages", []))
+                        if debug.get("keyword_boosted"):
+                            st.markdown("**Force-included via keyword boost (explicit Figure/Table N reference in query):**")
+                            st.json(debug.get("keyword_boosted", []))
                         st.markdown("**Compression scores (score, sentence preview) — for diagnosing empty-context bugs:**")
                         st.json(debug.get("compression_scores", []))
                         st.markdown("**Compressed context sent to the LLM:**")
