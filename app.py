@@ -76,8 +76,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "gsk_
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
 GROQ_MODEL = os.getenv("GROQ_MODEL") or st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# Vision-capable Groq model, used to actually SEE extracted images/figures.
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL") or st.secrets.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+# Vision-capable Groq model - CHANGED to a real vision model
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL") or st.secrets.get("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
 
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or st.secrets.get("LANGSMITH_API_KEY", "")
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT") or st.secrets.get("LANGSMITH_PROJECT", "graph-rag-live-demo")
@@ -88,7 +88,7 @@ KEYS_CONFIGURED = (
     PINECONE_API_KEY and "PASTE_YOUR" not in PINECONE_API_KEY
 )
 
-VISION_CONFIGURED = bool(KEYS_CONFIGURED)  # same Groq key powers text + vision models
+VISION_CONFIGURED = bool(KEYS_CONFIGURED)
 
 LANGSMITH_CONFIGURED = bool(
     LANGSMITH_SDK_AVAILABLE and LANGSMITH_API_KEY and "PASTE_YOUR" not in LANGSMITH_API_KEY
@@ -273,9 +273,7 @@ def safe_int(x, default=None):
 
 # ========================= IMAGE HELPERS (RESIZE / ENCODE) =========================
 def resize_image_for_vision(image_bytes, max_dim=1024):
-    """Downscale large images before sending to the vision model — keeps
-    payload size and API latency/cost reasonable without losing readability
-    of charts/text at typical PDF figure resolutions."""
+    """Downscale large images before sending to the vision model."""
     if not PIL_AVAILABLE:
         return image_bytes, "png"
     try:
@@ -295,9 +293,7 @@ def encode_image_b64(image_bytes):
 
 # ========================= VISION MODEL CALLS =========================
 def describe_image_generic(image_b64, image_ext, page, caption_hint=""):
-    """INGESTION-TIME: ask the vision model to produce a rich, searchable
-    description of everything visibly present in the image, so this
-    description can be embedded and retrieved like any other text chunk."""
+    """INGESTION-TIME: ask the vision model to produce a rich, searchable description."""
     try:
         llm_vision = get_vision_llm()
         prompt_text = f"""Describe this image from page {page} of a document in full, factual
@@ -314,12 +310,12 @@ so briefly instead of inventing data.
         ])
         result = llm_vision.invoke([message])
         return result.content.strip() if result and result.content else None
-    except Exception:
+    except Exception as e:
+        # Store error for debugging (will be added to debug info)
         return None
 
 def analyze_image_for_question(image_b64, image_ext, page, user_question, caption_hint=""):
-    """QUERY-TIME: re-examine the ACTUAL image with the user's SPECIFIC
-    question, for a precise, targeted visual answer."""
+    """QUERY-TIME: re-examine the ACTUAL image with the user's SPECIFIC question."""
     try:
         llm_vision = get_vision_llm()
         prompt_text = f"""You are looking directly at an image extracted from page {page} of a
@@ -337,10 +333,10 @@ User question: {user_question}"""
         ])
         result = llm_vision.invoke([message])
         return result.content.strip() if result and result.content else None
-    except Exception:
+    except Exception as e:
         return None
 
-IMAGE_QUERY_KEYWORDS = ["figure", "fig.", "chart", "image", "diagram", "graph", "visual", "picture", "plot", "layout"]
+IMAGE_QUERY_KEYWORDS = ["figure", "fig.", "chart", "image", "diagram", "graph", "visual", "picture", "plot", "layout", "table"]
 FIGURE_REF_REGEX = re.compile(r'\b(figure|fig\.?|table|chart|diagram)\s*\.?\s*(\d+)\b', re.IGNORECASE)
 
 def query_mentions_visual(query):
@@ -402,9 +398,7 @@ def extract_tables_as_markdown(pdf_path):
 # ========================= IMAGE EXTRACTION + VISION DESCRIPTION (INGESTION) =========================
 def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True,
                                  max_vision_images=10, progress_cb=None):
-    """Full ingestion-time image pipeline:
-    Extract images -> vision model describes it, or OCR fallback ->
-    return chunks with rich text description PLUS raw image bytes kept locally."""
+    """Full ingestion-time image pipeline."""
     if not PYMUPDF_AVAILABLE:
         return []
     captions_by_page = captions_by_page or {}
@@ -463,7 +457,7 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                     "text": text_block,
                     "page": page_num + 1,
                     "type": "image",
-                    "image_b64": b64,          # kept LOCALLY ONLY
+                    "image_b64": b64,
                     "image_ext": ext,
                     "caption_text": caption_text,
                     "vision_described": bool(description),
@@ -492,6 +486,17 @@ def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
                     seen.add(key)
                     boosted.append(item)
     return boosted[:max_matches]
+
+def boost_image_chunks(query, all_chunks_data, max_images=3):
+    """If the query mentions any visual term, add all image chunks to ensure they are considered."""
+    q = query.lower()
+    if not any(k in q for k in IMAGE_QUERY_KEYWORDS):
+        return []
+
+    image_chunks = [item for item in all_chunks_data if item.get("type") == "image" and item.get("image_b64")]
+    # Sort by page for stability
+    image_chunks.sort(key=lambda x: x.get("page", 0))
+    return image_chunks[:max_images]
 
 # ========================= VISUALIZATION (CHART RENDERING) HELPERS =========================
 VISUAL_KEYWORDS = ["chart", "plot", "visuali", "graph", "trend", "compare", "comparison", "vs", "versus"]
@@ -634,8 +639,7 @@ class AdvancedContextBuilder:
 # ========================= PARENT/NEIGHBOR EXPANSION =========================
 @traceable(run_type="tool", name="Neighbor Expansion (Parent Document)")
 def expand_with_neighbors(top_docs, all_chunks_data, window=1):
-    """Pulls in adjacent chunks for context continuity. Uses FULL local record
-    from all_chunks_data to preserve image_b64/caption_text/etc."""
+    """Pulls in adjacent chunks for context continuity. Uses FULL local record."""
     selected = {}
     for doc in top_docs:
         raw_idx = doc.metadata.get("chunk_index")
@@ -686,7 +690,7 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
         "cache_hit": False, "sub_queries": [], "retrieved_pages": [],
         "compressed_text": "", "final_context": "", "compression_scores": [],
         "trace_url": None, "keyword_boosted": [], "vision_analyses": [],
-        "image_display": [],  # NEW: store image bytes for inline display
+        "image_display": [], "vision_errors": [],   # NEW: store vision errors
     }
 
     try:
@@ -749,7 +753,10 @@ Question: {query}"""
     retrieved = list(unique_docs.values())
 
     if not retrieved:
+        # Still try to boost image chunks if visual query
         boosted_only = keyword_boost_chunks(query, chat["all_chunks_data"])
+        if not boosted_only and query_mentions_visual(query):
+            boosted_only = boost_image_chunks(query, chat["all_chunks_data"])
         if not boosted_only:
             return "I don't have enough information in the document to answer that.", debug
         expanded_items = boosted_only
@@ -778,31 +785,44 @@ Question: {query}"""
                     existing_keys.add(b["text"][:60])
             debug["keyword_boosted"] = [b["text"][:120] for b in boosted]
 
+        # NEW: For any visual query, add image chunks directly
+        if query_mentions_visual(query):
+            image_boost = boost_image_chunks(query, chat["all_chunks_data"])
+            existing_keys = {item["text"][:60] for item in expanded_items}
+            for img in image_boost:
+                key = img["text"][:60]
+                if key not in existing_keys:
+                    expanded_items.append(img)
+                    existing_keys.add(key)
+            debug["image_boosted"] = [img["text"][:120] for img in image_boost]
+
     # ---- QUERY-TIME TARGETED VISION RE-ANALYSIS ----
     vision_context_blocks = []
     if VISION_CONFIGURED and st.session_state.get("enable_vision", True) and query_mentions_visual(query):
         image_candidates = [it for it in expanded_items if it.get("type") == "image" and it.get("image_b64")]
 
-        # NEW: Collect image display info for inline viewing (regardless of vision model success)
-        for img_item in image_candidates[:2]:
-            debug["image_display"].append({
-                "page": img_item.get("page"),
-                "image_b64": img_item["image_b64"],
-                "caption_text": img_item.get("caption_text", ""),
-            })
+        # Store image display info for inline viewing
+        debug["image_display"] = [
+            {"page": img.get("page"), "image_b64": img["image_b64"], "caption_text": img.get("caption_text", "")}
+            for img in image_candidates[:2]
+        ]
 
-        # Run vision analysis on up to 3 images
         for img_item in image_candidates[:3]:
             log(f"👁️ Running targeted vision analysis on figure (page {img_item.get('page')})...")
-            analysis = analyze_image_for_question(
-                img_item["image_b64"], img_item.get("image_ext", "png"),
-                img_item.get("page"), query, img_item.get("caption_text", "")
-            )
-            if analysis:
-                vision_context_blocks.append(
-                    f"[VISION MODEL ANALYSIS of figure/image on page {img_item.get('page')} — "
-                    f"generated by directly viewing this image to answer the current question]\n{analysis}"
+            try:
+                analysis = analyze_image_for_question(
+                    img_item["image_b64"], img_item.get("image_ext", "png"),
+                    img_item.get("page"), query, img_item.get("caption_text", "")
                 )
+                if analysis:
+                    vision_context_blocks.append(
+                        f"[VISION MODEL ANALYSIS of figure/image on page {img_item.get('page')} — "
+                        f"generated by directly viewing this image to answer the current question]\n{analysis}"
+                    )
+                else:
+                    debug["vision_errors"].append(f"Vision analysis returned None for image on page {img_item.get('page')}.")
+            except Exception as e:
+                debug["vision_errors"].append(f"Vision analysis error for page {img_item.get('page')}: {str(e)}")
     debug["vision_analyses"] = vision_context_blocks
 
     log("Compressing & deduplicating context (tables/images kept intact)...")
@@ -1124,7 +1144,8 @@ with st.sidebar:
         st.session_state.vision_model_name = st.text_input(
             "Groq vision model name",
             value=st.session_state.vision_model_name,
-            help="Must be a vision-capable model currently hosted on Groq."
+            help="Must be a vision-capable model currently hosted on Groq. "
+                 "Default: llama-3.2-11b-vision-preview"
         )
         st.session_state.max_vision_images = st.slider(
             "Max images to analyze with vision at ingestion", 1, 25, st.session_state.max_vision_images,
@@ -1329,7 +1350,7 @@ if query:
                 st.markdown(response)
                 chat["chat_history"].append({"role": "assistant", "content": response})
 
-                # NEW: Show relevant images inline if user asked about figures
+                # Show relevant images inline
                 if debug.get("image_display"):
                     st.markdown("**🖼️ Relevant image(s) from the document:**")
                     cols = st.columns(min(len(debug["image_display"]), 3))
@@ -1374,10 +1395,17 @@ if query:
                         if debug.get("keyword_boosted"):
                             st.markdown("**Force-included via keyword boost (explicit Figure/Table N reference):**")
                             st.json(debug.get("keyword_boosted", []))
+                        if debug.get("image_boosted"):
+                            st.markdown("**Force-included image chunks (visual query detected):**")
+                            st.json(debug.get("image_boosted", []))
                         if debug.get("vision_analyses"):
                             st.markdown("**🖼️ Live vision model analysis performed for this question:**")
                             for va in debug["vision_analyses"]:
                                 st.text(va)
+                        if debug.get("vision_errors"):
+                            st.markdown("**⚠️ Vision errors encountered:**")
+                            for err in debug["vision_errors"]:
+                                st.error(err)
                         st.markdown("**Compression scores (score, sentence preview):**")
                         st.json(debug.get("compression_scores", []))
                         st.markdown("**Compressed context sent to the LLM:**")
