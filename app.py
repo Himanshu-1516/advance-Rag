@@ -27,7 +27,7 @@ from pinecone_text.sparse import BM25Encoder
 from pinecone import Pinecone, ServerlessSpec
 from langchain_community.retrievers import PineconeHybridSearchRetriever
 
-# ========================= OPTIONAL: TABLE / IMAGE EXTRACTION =========================
+# ========================= OPTIONAL TABLE / IMAGE EXTRACTION =========================
 try:
     import pdfplumber
     PDFPLUMBER_AVAILABLE = True
@@ -75,11 +75,6 @@ except Exception:
 GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "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")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
 GROQ_MODEL = os.getenv("GROQ_MODEL") or st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant")
-
-# Vision-capable Groq model, used to actually SEE extracted images/figures.
-# NOTE: Groq's available vision models change over time. If this default
-# starts erroring out, update it in the sidebar (Advanced vision settings)
-# without touching code, or change this default here.
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL") or st.secrets.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or st.secrets.get("LANGSMITH_API_KEY", "")
@@ -91,8 +86,6 @@ KEYS_CONFIGURED = (
     PINECONE_API_KEY and "PASTE_YOUR" not in PINECONE_API_KEY
 )
 
-VISION_CONFIGURED = bool(KEYS_CONFIGURED)  # same Groq key powers text + vision models
-
 LANGSMITH_CONFIGURED = bool(
     LANGSMITH_SDK_AVAILABLE and LANGSMITH_API_KEY and "PASTE_YOUR" not in LANGSMITH_API_KEY
 )
@@ -100,13 +93,120 @@ LANGSMITH_CONFIGURED = bool(
 # ========================= PAGE CONFIG =========================
 st.set_page_config(page_title="Graph RAG • Live Demo", page_icon="🧠", layout="wide")
 
+# ========================= CUSTOM CSS =========================
 st.markdown("""
 <style>
-    .main-header {font-size: 42px; font-weight: bold; color: #1E3A8A;}
-    .badge {padding: 4px 12px; border-radius: 12px; font-size: 13px; font-weight: bold;}
-    .cache-hit {background-color: #22c55e; color: white;}
-    .trace-badge {background-color: #6366f1; color: white;}
-    .vision-badge {background-color: #f59e0b; color: white;}
+    /* Global */
+    .main {
+        padding: 0 1rem;
+    }
+    .stApp {
+        background: #f8fafc;
+    }
+    .stChatMessage {
+        background: white;
+        border-radius: 16px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        padding: 12px 16px;
+        margin-bottom: 12px;
+    }
+    .stChatMessage.user {
+        background: #e8f0fe;
+        border-bottom-right-radius: 4px;
+    }
+    .stChatMessage.assistant {
+        background: white;
+        border-bottom-left-radius: 4px;
+    }
+    .main-header {
+        font-size: 2.6rem;
+        font-weight: 700;
+        background: linear-gradient(135deg, #1E3A8A 0%, #3B82F6 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.2rem;
+        letter-spacing: -0.02em;
+    }
+    .sub-header {
+        color: #475569;
+        font-size: 1rem;
+        font-weight: 400;
+        margin-bottom: 1.5rem;
+    }
+    .badge {
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        display: inline-block;
+        margin-right: 6px;
+    }
+    .badge-cache {
+        background: #22c55e;
+        color: white;
+    }
+    .badge-vision {
+        background: #f59e0b;
+        color: white;
+    }
+    .badge-trace {
+        background: #6366f1;
+        color: white;
+    }
+    .badge-trace a {
+        color: white;
+        text-decoration: none;
+    }
+    .badge-trace a:hover {
+        text-decoration: underline;
+    }
+    .sidebar .sidebar-content {
+        background: white;
+        border-right: 1px solid #e2e8f0;
+    }
+    .css-1d391kg {
+        background: white;
+    }
+    .stButton > button {
+        border-radius: 8px;
+        font-weight: 500;
+        transition: all 0.15s;
+    }
+    .stButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    }
+    .stTextInput > div > div > input {
+        border-radius: 8px;
+        border: 1px solid #cbd5e1;
+    }
+    .stFileUploader > div > div {
+        border-radius: 8px;
+        border: 2px dashed #94a3b8;
+        background: #f1f5f9;
+    }
+    .stExpander {
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        background: white;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .stProgress > div > div {
+        background: #3B82F6 !important;
+    }
+    .document-explorer .stExpander {
+        border-left: 4px solid #3B82F6;
+    }
+    .image-thumb {
+        border-radius: 8px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+    }
+    hr {
+        margin: 1.5rem 0;
+        border: 0;
+        height: 1px;
+        background: #e2e8f0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -171,7 +271,6 @@ def get_llm(deterministic=True):
     )
 
 def get_vision_llm():
-    """Vision-capable Groq model used to actually SEE extracted images."""
     model_name = st.session_state.get("vision_model_name", GROQ_VISION_MODEL)
     return ChatGroq(
         model=model_name,
@@ -197,11 +296,8 @@ def safe_int(x, default=None):
     except Exception:
         return default
 
-# ========================= IMAGE HELPERS (RESIZE / ENCODE) =========================
+# ========================= IMAGE HELPERS =========================
 def resize_image_for_vision(image_bytes, max_dim=1024):
-    """Downscale large images before sending to the vision model — keeps
-    payload size and API latency/cost reasonable without losing readability
-    of charts/text at typical PDF figure resolutions."""
     if not PIL_AVAILABLE:
         return image_bytes, "png"
     try:
@@ -221,11 +317,6 @@ def encode_image_b64(image_bytes):
 
 # ========================= VISION MODEL CALLS =========================
 def describe_image_generic(image_b64, image_ext, page, caption_hint=""):
-    """INGESTION-TIME: ask the vision model to produce a rich, searchable
-    description of everything visibly present in the image, so this
-    description can be embedded and retrieved like any other text chunk.
-    This is what makes an image findable at all when a user later asks
-    about 'the sales chart' or 'Figure 1'."""
     try:
         llm_vision = get_vision_llm()
         prompt_text = f"""Describe this image from page {page} of a document in full, factual
@@ -246,11 +337,6 @@ so briefly instead of inventing data.
         return None
 
 def analyze_image_for_question(image_b64, image_ext, page, user_question, caption_hint=""):
-    """QUERY-TIME: re-examine the ACTUAL image with the user's SPECIFIC
-    question, for a precise, targeted visual answer instead of relying on
-    the generic ingestion-time description. This is the step that lets the
-    assistant answer 'what does the chart on page 4 show' with real detail
-    instead of falling back on a canned refusal."""
     try:
         llm_vision = get_vision_llm()
         prompt_text = f"""You are looking directly at an image extracted from page {page} of a
@@ -278,13 +364,10 @@ def query_mentions_visual(query):
     q = query.lower()
     return any(k in q for k in IMAGE_QUERY_KEYWORDS) or bool(FIGURE_REF_REGEX.search(query))
 
-# ========================= TABLE / CAPTION EXTRACTION HELPERS =========================
+# ========================= TABLE / CAPTION EXTRACTION =========================
 CAPTION_REGEX = re.compile(r'((?:Figure|Fig\.?|Table|Chart|Diagram)\s*\d+[:.\-]?\s*[^\n]{0,220})', re.IGNORECASE)
 
 def extract_page_captions(pdf_path):
-    """Scan each page's real text layer for figure/table caption lines —
-    these remain extractable as text even when the figure itself is an
-    unreadable/complex image, and give the vision model grounding context."""
     captions_by_page = {}
     if not PYMUPDF_AVAILABLE:
         return captions_by_page
@@ -301,7 +384,6 @@ def extract_page_captions(pdf_path):
     return captions_by_page
 
 def extract_tables_as_markdown(pdf_path):
-    """Extract tables with row/column structure preserved (as markdown)."""
     if not PDFPLUMBER_AVAILABLE:
         return []
     table_chunks = []
@@ -327,19 +409,15 @@ def extract_tables_as_markdown(pdf_path):
                         "text": f"[TABLE from page {page_num}]\n{md}",
                         "page": page_num,
                         "type": "table",
+                        "markdown": md,  # store clean markdown for display
                     })
     except Exception:
         pass
     return table_chunks
 
-# ========================= IMAGE EXTRACTION + VISION DESCRIPTION (INGESTION) =========================
+# ========================= IMAGE EXTRACTION + VISION DESCRIPTION =========================
 def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True,
                                  max_vision_images=10, progress_cb=None):
-    """Full ingestion-time image pipeline:
-    Extract images -> (vision model describes it, or OCR fallback) ->
-    return chunks with rich text description PLUS the raw image bytes
-    (base64) kept locally for query-time targeted re-analysis.
-    """
     if not PYMUPDF_AVAILABLE:
         return []
     captions_by_page = captions_by_page or {}
@@ -361,7 +439,6 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                 except Exception:
                     continue
 
-                # Skip tiny images (icons/bullets/decorative dividers) — noise, not content
                 if len(image_bytes) < 3000:
                     continue
 
@@ -398,21 +475,19 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                     "text": text_block,
                     "page": page_num + 1,
                     "type": "image",
-                    "image_b64": b64,          # kept LOCALLY ONLY — never sent to Pinecone metadata
+                    "image_b64": b64,
                     "image_ext": ext,
                     "caption_text": caption_text,
                     "vision_described": bool(description),
+                    "raw_bytes": image_bytes,  # for thumbnail display
                 })
         doc.close()
     except Exception:
         pass
     return image_chunks
 
-# ========================= KEYWORD-BOOST RETRIEVAL FOR NAMED FIGURES/TABLES =========================
+# ========================= KEYWORD-BOOST RETRIEVAL =========================
 def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
-    """If the user explicitly names a figure/table/chart number, force-include
-    every chunk that literally mentions it, bypassing embedding/BM25 ranking
-    gaps (short captions/figure blocks often rank poorly for vague questions)."""
     matches_needed = FIGURE_REF_REGEX.findall(query)
     if not matches_needed:
         return []
@@ -429,7 +504,7 @@ def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
                     boosted.append(item)
     return boosted[:max_matches]
 
-# ========================= VISUALIZATION (CHART RENDERING) HELPERS =========================
+# ========================= VISUALIZATION HELPERS =========================
 VISUAL_KEYWORDS = ["chart", "plot", "visuali", "graph", "trend", "compare", "comparison", "vs", "versus"]
 
 def wants_visualization(query):
@@ -483,9 +558,6 @@ class SemanticCache:
 
 
 class AdvancedContextBuilder:
-    """Sentence-level dedup + compression for PROSE, with a separate path for
-    TABLE and IMAGE chunks (kept intact, ranked as whole blocks — sentence
-    tokenization destroys table rows and unfairly penalizes image/caption blocks)."""
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
@@ -568,15 +640,9 @@ class AdvancedContextBuilder:
         return "\n\n".join(parts), score_log
 
 
-# ========================= PARENT/NEIGHBOR EXPANSION =========================
+# ========================= NEIGHBOR EXPANSION =========================
 @traceable(run_type="tool", name="Neighbor Expansion (Parent Document)")
 def expand_with_neighbors(top_docs, all_chunks_data, window=1):
-    """Pulls in adjacent chunks for context continuity. CRITICAL: when the
-    matched chunk_index exists locally, we use the FULL local record from
-    all_chunks_data (which carries image_b64/caption_text/etc.) rather than
-    reconstructing a stripped-down dict from Pinecone metadata alone — this
-    is what preserves the actual image bytes needed for query-time vision
-    re-analysis all the way through retrieval."""
     selected = {}
     for doc in top_docs:
         raw_idx = doc.metadata.get("chunk_index")
@@ -616,7 +682,7 @@ def compute_consistency(responses):
     return float(np.mean(sims)) if sims else 1.0
 
 
-# ========================= CORE PIPELINE (SHARED BY CHAT UI + EVAL HARNESS) =========================
+# ========================= CORE PIPELINE =========================
 @traceable(run_type="chain", name="RAG Pipeline")
 def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=None):
     def log(msg):
@@ -705,10 +771,10 @@ Question: {query}"""
              "type": d.metadata.get("type", "text"), "preview": d.page_content[:120] + "..."} for d in top_docs
         ]
 
-        log("Expanding with neighboring context (parent-document retrieval)...")
+        log("Expanding with neighboring context...")
         expanded_items = expand_with_neighbors(top_docs, chat["all_chunks_data"], window=1)
 
-        log("Checking for explicitly named figures/tables to force-include...")
+        log("Checking for explicitly named figures/tables...")
         boosted = keyword_boost_chunks(query, chat["all_chunks_data"])
         if boosted:
             existing_keys = {item["text"][:60] for item in expanded_items}
@@ -718,11 +784,7 @@ Question: {query}"""
                     existing_keys.add(b["text"][:60])
             debug["keyword_boosted"] = [b["text"][:120] for b in boosted]
 
-    # ---- QUERY-TIME TARGETED VISION RE-ANALYSIS ----
-    # If the question is visually oriented AND we have real image bytes for a
-    # candidate figure, re-examine the ACTUAL image with the user's specific
-    # question. This is the step that fixes "no readable text" refusals —
-    # OCR/generic descriptions are a fallback, not the primary answer path.
+    # ---- QUERY-TIME VISION RE-ANALYSIS ----
     vision_context_blocks = []
     if VISION_CONFIGURED and st.session_state.get("enable_vision", True) and query_mentions_visual(query):
         image_candidates = [it for it in expanded_items if it.get("type") == "image" and it.get("image_b64")]
@@ -739,7 +801,7 @@ Question: {query}"""
                 )
     debug["vision_analyses"] = vision_context_blocks
 
-    log("Compressing & deduplicating context (tables/images kept intact)...")
+    log("Compressing & deduplicating context...")
     context_builder = AdvancedContextBuilder(reranker)
     compressed_text, score_log = context_builder.build_and_compress(
         expanded_items, query, max_sentences=22, debug_scores=(status is not None)
@@ -885,7 +947,26 @@ SECTION 4 — HANDLING INSUFFICIENT OR PARTIAL INFORMATION
 - Never pad an incomplete answer with speculation.
 
 ====================================================================
-SECTION 5 — OUTPUT FORMATTING RULES
+SECTION 5 — CLARIFICATION & AMBIGUITY HANDLING
+====================================================================
+
+If the user's question is **vague, broad, or missing context** (e.g., "What does this mean?",
+"Explain this", "Tell me about the figures"), follow these steps **before** attempting to answer:
+
+1. **Identify the ambiguity** – Is it unclear which part of the document they're asking about?
+   Are they referring to a specific figure, table, or concept?
+2. **Ask a clarifying question** – Politely prompt the user to specify the topic, page, figure
+   number, or aspect they are interested in.
+3. **Only if the question is already self‑contained** (e.g., "What is the revenue for Q3?"),
+   proceed to answer directly using the available context.
+
+**Example:**  
+User: "What does this chart show?"  
+Assistant: "I see there are multiple charts in the document. Could you please specify which
+chart you are referring to (e.g., Figure 3, or the chart on page 7)?"
+
+====================================================================
+SECTION 6 — OUTPUT FORMATTING RULES
 ====================================================================
 
 - Write in clear, natural, professional prose.
@@ -899,7 +980,7 @@ SECTION 5 — OUTPUT FORMATTING RULES
   explanation, using standard `| Column | Column |` syntax.
 
 ====================================================================
-SECTION 6 — TONE AND STYLE
+SECTION 7 — TONE AND STYLE
 ====================================================================
 
 - Be direct and confident when the Context Data (including vision analysis)
@@ -909,7 +990,7 @@ SECTION 6 — TONE AND STYLE
 - Match answer length/detail to question complexity.
 
 ====================================================================
-SECTION 7 — FINAL SELF-CHECK (perform silently before responding)
+SECTION 8 — FINAL SELF-CHECK (perform silently before responding)
 ====================================================================
 
 1. Did I check for a vision analysis block before treating a figure as
@@ -921,6 +1002,7 @@ SECTION 7 — FINAL SELF-CHECK (perform silently before responding)
    the whole question?
 6. If tables/figures/comparisons/visualization were involved, did I include
    a markdown table before my explanation?
+7. If the query was ambiguous, did I ask for clarification before answering?
 
 Only output the final answer — never show this checklist to the user.
 
@@ -978,6 +1060,7 @@ st.session_state.setdefault("show_debug", True)
 st.session_state.setdefault("enable_vision", True)
 st.session_state.setdefault("vision_model_name", GROQ_VISION_MODEL)
 st.session_state.setdefault("max_vision_images", 10)
+st.session_state.setdefault("show_document_explorer", False)  # for toggle
 
 # ========================= HELPER =========================
 def wait_for_index_ready(pc, index_name, timeout=90):
@@ -994,7 +1077,7 @@ def wait_for_index_ready(pc, index_name, timeout=90):
 
 # ========================= SIDEBAR =========================
 with st.sidebar:
-    st.header("💬 Chats")
+    st.markdown("### 💬 Chats")
     if st.button("➕ New Chat", use_container_width=True):
         st.session_state.current_chat_id = create_new_chat()
         st.rerun()
@@ -1019,7 +1102,7 @@ with st.sidebar:
     chat = st.session_state.chats[st.session_state.current_chat_id]
 
     st.divider()
-    st.header("⚙️ Settings")
+    st.markdown("### ⚙️ Settings")
     st.session_state.deterministic_mode = st.checkbox(
         "Deterministic mode (temperature=0)", value=st.session_state.deterministic_mode,
         help="Keep ON so the same question always gives the same answer."
@@ -1036,52 +1119,48 @@ with st.sidebar:
         st.success("Cache cleared for this chat.")
 
     st.divider()
-    st.header("🖼️ Vision Model (Image Understanding)")
+    st.markdown("### 🖼️ Vision Model")
     if PYMUPDF_AVAILABLE and VISION_CONFIGURED:
         st.success("✅ Vision pipeline available")
     elif not PYMUPDF_AVAILABLE:
-        st.warning("Install `pymupdf` to enable image extraction: `pip install pymupdf`")
+        st.warning("Install `pymupdf` to enable image extraction.")
     else:
         st.warning("Vision requires a configured GROQ_API_KEY.")
 
     st.session_state.enable_vision = st.checkbox(
         "Enable vision-based image understanding",
         value=st.session_state.enable_vision,
-        help="Uses a multimodal Groq model to actually look at extracted images/figures "
-             "(charts, diagrams) instead of relying only on OCR."
+        help="Uses a multimodal Groq model to actually look at extracted images/figures."
     )
     with st.expander("Advanced vision settings"):
         st.session_state.vision_model_name = st.text_input(
             "Groq vision model name",
             value=st.session_state.vision_model_name,
-            help="Must be a vision-capable model currently hosted on Groq. "
-                 "Update this here (no code change needed) if the default gets deprecated."
+            help="Must be a vision-capable model currently hosted on Groq."
         )
         st.session_state.max_vision_images = st.slider(
             "Max images to analyze with vision at ingestion", 1, 25, st.session_state.max_vision_images,
-            help="Caps vision API calls during document processing to control cost/time."
+            help="Caps vision API calls during document processing."
         )
     if PYMUPDF_AVAILABLE and not OCR_AVAILABLE:
-        st.info("OCR fallback not installed — that's fine as long as vision is enabled. "
-                "Run `pip install pytesseract pillow` (+ Tesseract binary) for an extra fallback layer.")
+        st.info("OCR fallback not installed — that's fine as long as vision is enabled.")
     if PDFPLUMBER_AVAILABLE:
         st.success("✅ Table extraction enabled (pdfplumber)")
     else:
-        st.warning("Table extraction disabled — run `pip install pdfplumber` to enable.")
+        st.warning("Table extraction disabled — run `pip install pdfplumber`.")
 
     st.divider()
-    st.header("🔎 LangSmith Tracing")
+    st.markdown("### 🔎 LangSmith Tracing")
     if not LANGSMITH_SDK_AVAILABLE:
-        st.warning("`langsmith` package not installed. Run `pip install -U langsmith`.")
+        st.warning("`langsmith` package not installed.")
     elif not LANGSMITH_CONFIGURED:
         st.warning(
-            "LangSmith API key not configured. Set `LANGSMITH_API_KEY` (and optionally "
-            "`LANGSMITH_PROJECT`) as an env var or Streamlit secret to enable tracing."
+            "LangSmith API key not configured. Set `LANGSMITH_API_KEY` as an env var or Streamlit secret."
         )
     else:
         toggled = st.checkbox(
             "Enable tracing", value=st.session_state.langsmith_tracing_enabled,
-            help="Sends every LLM call, retrieval, and pipeline step to LangSmith for inspection."
+            help="Sends every LLM call, retrieval, and pipeline step to LangSmith."
         )
         if toggled != st.session_state.langsmith_tracing_enabled:
             st.session_state.langsmith_tracing_enabled = toggled
@@ -1095,7 +1174,7 @@ with st.sidebar:
             st.info("Tracing is currently OFF.")
 
     st.divider()
-    st.header("🛠️ Document Setup")
+    st.markdown("### 🛠️ Document Setup")
 
     new_name = st.text_input("Chat name", value=chat["name"], key=f"name_{st.session_state.current_chat_id}")
     if new_name and new_name != chat["name"]:
@@ -1159,7 +1238,7 @@ with st.sidebar:
                 bm25.fit(texts)
                 chat["bm25_encoder"] = bm25
 
-                chat["all_chunks_data"] = all_items  # local full records (incl. image_b64)
+                chat["all_chunks_data"] = all_items
 
                 st.write("🔧 Connecting to Pinecone...")
                 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -1180,9 +1259,6 @@ with st.sidebar:
                 for i, item in enumerate(all_items):
                     dense = embeddings.embed_query(item["text"])
                     sparse = bm25.encode_documents([item["text"]])[0]
-                    # IMPORTANT: never put image_b64 into Pinecone metadata —
-                    # it's large binary-as-text data and unnecessary for
-                    # search; only the text description needs to be indexed.
                     vectors.append({
                         "id": f"chunk_{i}", "values": dense, "sparse_values": sparse,
                         "metadata": {
@@ -1222,19 +1298,54 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Advanced RAG System</p>', unsafe_allow_html=True)
-st.caption("Deterministic • Multi-Hop Retrieval • Vision-Grounded Tables & Figures • Auto-Visualization • LangSmith Traced")
+st.markdown('<p class="sub-header">Deterministic • Multi‑Hop Retrieval • Vision‑Grounded Tables & Figures • Auto‑Visualization • LangSmith Traced</p>',
+            unsafe_allow_html=True)
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
+
+# ---- DOCUMENT EXPLORER TOGGLE ----
+if chat["pdf_processed"] and chat["all_chunks_data"]:
+    if st.button("📂 Toggle Document Explorer (Tables & Images)"):
+        st.session_state.show_document_explorer = not st.session_state.show_document_explorer
+
+    if st.session_state.show_document_explorer:
+        with st.expander("📄 Document Explorer – Extracted Tables & Images", expanded=True):
+            tables = [item for item in chat["all_chunks_data"] if item.get("type") == "table"]
+            images = [item for item in chat["all_chunks_data"] if item.get("type") == "image"]
+
+            if tables:
+                st.markdown("#### 📊 Tables")
+                for t in tables:
+                    with st.container():
+                        st.markdown(f"**Page {t['page']}**")
+                        st.markdown(t.get("markdown", t["text"]))
+                        st.divider()
+
+            if images:
+                st.markdown("#### 🖼️ Images")
+                cols = st.columns(3)
+                for idx, img in enumerate(images):
+                    with cols[idx % 3]:
+                        try:
+                            img_data = base64.b64decode(img["image_b64"])
+                            st.image(img_data, caption=f"Page {img['page']}", use_container_width=True)
+                            with st.expander("Description"):
+                                st.write(img["text"])
+                        except Exception:
+                            st.write(f"Image on page {img['page']} (preview unavailable)")
+                        st.divider()
 
 if not chat["pdf_processed"]:
     st.info("👈 Upload a PDF for this chat in the sidebar, then click **Process Document** to start chatting.")
     st.stop()
 
+# ---- CHAT HISTORY ----
 for message in chat["chat_history"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
+# ---- INPUT ----
 query = st.chat_input("Ask any question about your document (text, tables, or figures)...")
 
 if query:
@@ -1260,18 +1371,19 @@ if query:
 
                 if debug.get("cache_hit"):
                     st.markdown(
-                        f"<span class='badge cache-hit'>⚡ CACHE HIT ({debug['similarity']:.2f})</span><br><br>",
+                        f"<span class='badge badge-cache'>⚡ CACHE HIT ({debug['similarity']:.2f})</span><br><br>",
                         unsafe_allow_html=True
                     )
                 if debug.get("vision_analyses"):
                     st.markdown(
-                        "<span class='badge vision-badge'>👁️ Vision model analyzed an image for this answer</span><br><br>",
+                        "<span class='badge badge-vision'>👁️ Vision model analyzed an image for this answer</span><br><br>",
                         unsafe_allow_html=True
                     )
 
                 st.markdown(response)
                 chat["chat_history"].append({"role": "assistant", "content": response})
 
+                # ---- AUTO-VISUALIZATION ----
                 if wants_visualization(query):
                     df = extract_markdown_table(response)
                     if df is not None and df.shape[1] >= 2 and df.shape[0] >= 2:
@@ -1285,9 +1397,25 @@ if query:
                         except Exception:
                             pass
 
+                # ---- INLINE IMAGE DISPLAY (if figure referenced) ----
+                if PYMUPDF_AVAILABLE and st.session_state.get("enable_vision", True):
+                    refs = FIGURE_REF_REGEX.findall(query)
+                    if refs:
+                        for label, num in refs:
+                            pattern = re.compile(rf'{re.escape(label)}\.?\s*{re.escape(num)}\b', re.IGNORECASE)
+                            for item in chat["all_chunks_data"]:
+                                if item.get("type") == "image" and pattern.search(item["text"]):
+                                    try:
+                                        img_data = base64.b64decode(item["image_b64"])
+                                        st.image(img_data, caption=f"Figure {num} (Page {item['page']})",
+                                                 use_container_width=True)
+                                    except Exception:
+                                        pass
+                                    break  # show first matching image
+
                 if debug.get("trace_url"):
                     st.markdown(
-                        f"<span class='badge trace-badge'>🔗 <a href='{debug['trace_url']}' target='_blank' style='color:white;'>View trace in LangSmith</a></span>",
+                        f"<span class='badge badge-trace'>🔗 <a href='{debug['trace_url']}' target='_blank'>View trace in LangSmith</a></span>",
                         unsafe_allow_html=True
                     )
 
