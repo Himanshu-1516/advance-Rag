@@ -41,7 +41,7 @@ except ImportError:
     PYMUPDF_AVAILABLE = False
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -76,8 +76,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "gsk_
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
 GROQ_MODEL = os.getenv("GROQ_MODEL") or st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# Vision-capable Groq model - CHANGED to a real vision model
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL") or st.secrets.get("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
+# Vision-capable Groq models (fallback list)
+DEFAULT_VISION_MODELS = [
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
+]
 
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or st.secrets.get("LANGSMITH_API_KEY", "")
 LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT") or st.secrets.get("LANGSMITH_PROJECT", "graph-rag-live-demo")
@@ -109,7 +112,7 @@ st.markdown("""
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
     .stApp {
-        background: linear-gradient(135deg, #f5f7fa 0%, #eef2f7 100%);
+        background: linear-gradient(160deg, #f8fafc 0%, #e2e8f0 100%);
     }
 
     /* Main header */
@@ -135,6 +138,11 @@ st.markdown("""
         margin-bottom: 12px;
         box-shadow: 0 2px 8px rgba(0,0,0,0.04);
         border: 1px solid #e2e8f0;
+    }
+    /* Differentiate user vs assistant bubbles subtly */
+    div[data-testid="stChatMessage"]:has(.stChatMessageAvatarUser) {
+        background-color: #f0f4ff;
+        border-color: #c7d2fe;
     }
 
     /* Badges */
@@ -244,14 +252,33 @@ def get_llm(deterministic=True):
         temperature=0.0 if deterministic else 0.7,
     )
 
-def get_vision_llm():
-    """Vision-capable Groq model used to actually SEE extracted images."""
-    model_name = st.session_state.get("vision_model_name", GROQ_VISION_MODEL)
+def get_vision_llm(model_name):
+    """Return a ChatGroq instance for a specific vision model."""
     return ChatGroq(
         model=model_name,
         api_key=GROQ_API_KEY,
         temperature=0.0,
     )
+
+# ========================= VISION HELPER: TRY MULTIPLE MODELS =========================
+def try_vision_call(prompt_text, image_b64, image_ext, model_list):
+    """Try a list of vision models in order. Returns (result, error_message)."""
+    errors = []
+    for model in model_list:
+        try:
+            llm_vision = get_vision_llm(model)
+            message = HumanMessage(content=[
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/{image_ext};base64,{image_b64}"}},
+            ])
+            result = llm_vision.invoke([message])
+            if result and result.content:
+                return result.content.strip(), None
+            else:
+                errors.append(f"Model {model}: returned empty content.")
+        except Exception as e:
+            errors.append(f"Model {model}: {str(e)}")
+    return None, "\n".join(errors)
 
 # ========================= LEAKAGE UTILITIES =========================
 LEAK_PATTERNS = [
@@ -291,12 +318,12 @@ def resize_image_for_vision(image_bytes, max_dim=1024):
 def encode_image_b64(image_bytes):
     return base64.b64encode(image_bytes).decode("utf-8")
 
-# ========================= VISION MODEL CALLS =========================
-def describe_image_generic(image_b64, image_ext, page, caption_hint=""):
-    """INGESTION-TIME: ask the vision model to produce a rich, searchable description."""
-    try:
-        llm_vision = get_vision_llm()
-        prompt_text = f"""Describe this image from page {page} of a document in full, factual
+# ========================= VISION MODEL CALLS (with fallback) =========================
+def describe_image_generic(image_b64, image_ext, page, caption_hint="", model_list=None):
+    """INGESTION-TIME: Describe image using fallback vision models."""
+    if model_list is None:
+        model_list = st.session_state.get("vision_model_list", DEFAULT_VISION_MODELS)
+    prompt_text = f"""Describe this image from page {page} of a document in full, factual
 detail for someone who cannot see it. Include: the type of visual (bar chart, line chart,
 pie chart, table-like image, diagram, photo, logo, etc.), any title, axis labels, legend
 entries, every visible numeric data point and what it corresponds to, and any other text
@@ -304,21 +331,13 @@ printed in the image. Be precise with numbers — copy them exactly as shown, do
 or estimate. If this is not a data visualization (e.g., a logo or decorative photo), say
 so briefly instead of inventing data.
 {"A caption associated with this image in the document text reads: " + caption_hint if caption_hint else ""}"""
-        message = HumanMessage(content=[
-            {"type": "text", "text": prompt_text},
-            {"type": "image_url", "image_url": {"url": f"data:image/{image_ext};base64,{image_b64}"}},
-        ])
-        result = llm_vision.invoke([message])
-        return result.content.strip() if result and result.content else None
-    except Exception as e:
-        # Store error for debugging (will be added to debug info)
-        return None
+    return try_vision_call(prompt_text, image_b64, image_ext, model_list)
 
-def analyze_image_for_question(image_b64, image_ext, page, user_question, caption_hint=""):
-    """QUERY-TIME: re-examine the ACTUAL image with the user's SPECIFIC question."""
-    try:
-        llm_vision = get_vision_llm()
-        prompt_text = f"""You are looking directly at an image extracted from page {page} of a
+def analyze_image_for_question(image_b64, image_ext, page, user_question, caption_hint="", model_list=None):
+    """QUERY-TIME: Re-examine image with the user's specific question, using fallback models."""
+    if model_list is None:
+        model_list = st.session_state.get("vision_model_list", DEFAULT_VISION_MODELS)
+    prompt_text = f"""You are looking directly at an image extracted from page {page} of a
 document. Answer the user's question using ONLY what is visually present in this image —
 chart type, title, axis labels, legend, every visible numeric data point, trend lines,
 layout/positioning, colors (if relevant to distinguishing categories), and any printed text.
@@ -327,15 +346,9 @@ relevant to the question, say so plainly instead of guessing.
 {"A caption/reference associated with this image reads: " + caption_hint if caption_hint else ""}
 
 User question: {user_question}"""
-        message = HumanMessage(content=[
-            {"type": "text", "text": prompt_text},
-            {"type": "image_url", "image_url": {"url": f"data:image/{image_ext};base64,{image_b64}"}},
-        ])
-        result = llm_vision.invoke([message])
-        return result.content.strip() if result and result.content else None
-    except Exception as e:
-        return None
+    return try_vision_call(prompt_text, image_b64, image_ext, model_list)
 
+# ========================= IMAGE QUERY DETECTION =========================
 IMAGE_QUERY_KEYWORDS = ["figure", "fig.", "chart", "image", "diagram", "graph", "visual", "picture", "plot", "layout", "table"]
 FIGURE_REF_REGEX = re.compile(r'\b(figure|fig\.?|table|chart|diagram)\s*\.?\s*(\d+)\b', re.IGNORECASE)
 
@@ -398,7 +411,7 @@ def extract_tables_as_markdown(pdf_path):
 # ========================= IMAGE EXTRACTION + VISION DESCRIPTION (INGESTION) =========================
 def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True,
                                  max_vision_images=10, progress_cb=None):
-    """Full ingestion-time image pipeline."""
+    """Full ingestion-time image pipeline with fallback and error capture."""
     if not PYMUPDF_AVAILABLE:
         return []
     captions_by_page = captions_by_page or {}
@@ -428,10 +441,11 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                 b64 = encode_image_b64(resized_bytes)
 
                 description = None
+                vision_error = None
                 if use_vision and VISION_CONFIGURED and vision_calls_used < max_vision_images:
                     if progress_cb:
                         progress_cb(f"🖼️ Vision model analyzing image on page {page_num + 1}...")
-                    description = describe_image_generic(b64, ext, page_num + 1, caption_text)
+                    description, vision_error = describe_image_generic(b64, ext, page_num + 1, caption_text)
                     vision_calls_used += 1
 
                 ocr_text = ""
@@ -461,16 +475,16 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                     "image_ext": ext,
                     "caption_text": caption_text,
                     "vision_described": bool(description),
+                    "vision_error": vision_error,   # store error if any
                 })
         doc.close()
     except Exception:
         pass
     return image_chunks
 
-# ========================= KEYWORD-BOOST RETRIEVAL FOR NAMED FIGURES/TABLES =========================
+# ========================= KEYWORD-BOOST RETRIEVAL =========================
 def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
-    """If the user explicitly names a figure/table/chart number, force-include
-    every chunk that literally mentions it."""
+    """If the user explicitly names a figure/table/chart number, force-include every chunk that mentions it."""
     matches_needed = FIGURE_REF_REGEX.findall(query)
     if not matches_needed:
         return []
@@ -494,7 +508,6 @@ def boost_image_chunks(query, all_chunks_data, max_images=3):
         return []
 
     image_chunks = [item for item in all_chunks_data if item.get("type") == "image" and item.get("image_b64")]
-    # Sort by page for stability
     image_chunks.sort(key=lambda x: x.get("page", 0))
     return image_chunks[:max_images]
 
@@ -552,8 +565,7 @@ class SemanticCache:
 
 
 class AdvancedContextBuilder:
-    """Sentence-level dedup + compression for PROSE, with a separate path for
-    TABLE and IMAGE chunks (kept intact, ranked as whole blocks)."""
+    """Sentence-level dedup + compression for PROSE, with a separate path for TABLE and IMAGE chunks."""
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
@@ -679,7 +691,7 @@ def compute_consistency(responses):
     return float(np.mean(sims)) if sims else 1.0
 
 
-# ========================= CORE PIPELINE (SHARED BY CHAT UI + EVAL HARNESS) =========================
+# ========================= CORE PIPELINE =========================
 @traceable(run_type="chain", name="RAG Pipeline")
 def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=None):
     def log(msg):
@@ -690,7 +702,7 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
         "cache_hit": False, "sub_queries": [], "retrieved_pages": [],
         "compressed_text": "", "final_context": "", "compression_scores": [],
         "trace_url": None, "keyword_boosted": [], "vision_analyses": [],
-        "image_display": [], "vision_errors": [],   # NEW: store vision errors
+        "image_display": [], "vision_errors": [], "image_boosted": [],
     }
 
     try:
@@ -809,20 +821,17 @@ Question: {query}"""
 
         for img_item in image_candidates[:3]:
             log(f"👁️ Running targeted vision analysis on figure (page {img_item.get('page')})...")
-            try:
-                analysis = analyze_image_for_question(
-                    img_item["image_b64"], img_item.get("image_ext", "png"),
-                    img_item.get("page"), query, img_item.get("caption_text", "")
+            analysis, error = analyze_image_for_question(
+                img_item["image_b64"], img_item.get("image_ext", "png"),
+                img_item.get("page"), query, img_item.get("caption_text", "")
+            )
+            if analysis:
+                vision_context_blocks.append(
+                    f"[VISION MODEL ANALYSIS of figure/image on page {img_item.get('page')} — "
+                    f"generated by directly viewing this image to answer the current question]\n{analysis}"
                 )
-                if analysis:
-                    vision_context_blocks.append(
-                        f"[VISION MODEL ANALYSIS of figure/image on page {img_item.get('page')} — "
-                        f"generated by directly viewing this image to answer the current question]\n{analysis}"
-                    )
-                else:
-                    debug["vision_errors"].append(f"Vision analysis returned None for image on page {img_item.get('page')}.")
-            except Exception as e:
-                debug["vision_errors"].append(f"Vision analysis error for page {img_item.get('page')}: {str(e)}")
+            else:
+                debug["vision_errors"].append(f"Vision analysis error for page {img_item.get('page')}: {error}")
     debug["vision_analyses"] = vision_context_blocks
 
     log("Compressing & deduplicating context (tables/images kept intact)...")
@@ -1067,7 +1076,7 @@ st.session_state.setdefault("deterministic_mode", True)
 st.session_state.setdefault("use_cache", True)
 st.session_state.setdefault("show_debug", True)
 st.session_state.setdefault("enable_vision", True)
-st.session_state.setdefault("vision_model_name", GROQ_VISION_MODEL)
+st.session_state.setdefault("vision_model_list", DEFAULT_VISION_MODELS)
 st.session_state.setdefault("max_vision_images", 10)
 
 # ========================= HELPER =========================
@@ -1141,16 +1150,45 @@ with st.sidebar:
         help="Uses a multimodal Groq model to actually look at extracted images/figures."
     )
     with st.expander("Advanced vision settings"):
-        st.session_state.vision_model_name = st.text_input(
-            "Groq vision model name",
-            value=st.session_state.vision_model_name,
-            help="Must be a vision-capable model currently hosted on Groq. "
-                 "Default: llama-3.2-11b-vision-preview"
+        # Let user edit the model list (one per line)
+        current_models = "\n".join(st.session_state.vision_model_list)
+        new_models = st.text_area(
+            "Vision model names (one per line, tried in order)",
+            value=current_models,
+            height=100,
+            key="vision_model_list_editor"
         )
+        if new_models != current_models:
+            st.session_state.vision_model_list = [m.strip() for m in new_models.splitlines() if m.strip()]
+
         st.session_state.max_vision_images = st.slider(
             "Max images to analyze with vision at ingestion", 1, 25, st.session_state.max_vision_images,
             help="Caps vision API calls during document processing to control cost/time."
         )
+
+        # Test button
+        if st.button("🔍 Test Vision Model", use_container_width=True):
+            with st.spinner("Testing vision model..."):
+                # Create a simple test image (a colored square with text)
+                if PIL_AVAILABLE:
+                    img = Image.new('RGB', (200, 100), color=(73, 109, 137))
+                    draw = ImageDraw.Draw(img)
+                    draw.text((10, 40), "Hello Vision", fill=(255, 255, 0))
+                    buf = io_module.BytesIO()
+                    img.save(buf, format="PNG")
+                    test_img_b64 = encode_image_b64(buf.getvalue())
+                    test_ext = "png"
+                    test_prompt = "Describe what you see in this image."
+                    result, err = try_vision_call(test_prompt, test_img_b64, test_ext, st.session_state.vision_model_list)
+                    if result:
+                        st.success("✅ Vision model works! Response:")
+                        st.write(result)
+                    else:
+                        st.error("❌ Vision test failed. Error(s):")
+                        st.code(err)
+                else:
+                    st.error("Pillow not installed, cannot create test image.")
+
     if PYMUPDF_AVAILABLE and not OCR_AVAILABLE:
         st.info("OCR fallback not installed — that's fine as long as vision is enabled.")
     if PDFPLUMBER_AVAILABLE:
@@ -1227,10 +1265,11 @@ with st.sidebar:
                         captions_by_page=page_captions,
                         use_vision=st.session_state.enable_vision,
                         max_vision_images=st.session_state.max_vision_images,
-                        progress_cb=None,  # silent processing
+                        progress_cb=None,  # silent
                     )
 
                 vision_count = sum(1 for it in image_items if it.get("vision_described"))
+                vision_errors_during_ingest = [it.get("vision_error") for it in image_items if it.get("vision_error")]
 
                 all_items = text_items + table_items + image_items
                 for idx, item in enumerate(all_items):
@@ -1281,6 +1320,11 @@ with st.sidebar:
                     chat["name"] = uploaded_file.name[:30]
                 st.success(f"✅ Document processed! {len(all_items)} chunks indexed "
                            f"({len(text_items)} text, {len(table_items)} table, {len(image_items)} image).")
+                if vision_errors_during_ingest:
+                    st.warning("Some vision descriptions failed during ingestion. See debug info for details.")
+                    if st.session_state.show_debug:
+                        for err in vision_errors_during_ingest[:3]:
+                            st.code(err)
 
         except Exception as e:
             st.error(f"Error while processing document: {str(e)}")
