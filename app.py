@@ -72,19 +72,19 @@ except Exception:
         return None
 
 # ========================= API KEYS =========================
-gemini_api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "AIzaSyBbhIG-nBJMuazib7Yr5H-pHxD40drLCmY")
+gemini_api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
 GEMINI_API_KEY = gemini_api_key
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "")
 
-# Main text model (Gemini free-tier model)
+# Main text model
 GEMINI_MODEL = os.getenv("GEMINI_MODEL") or st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
 
-# Gemini is natively multimodal — the same models handle vision.
-# Listed in fallback order (tried in sequence if one fails/rate-limits).
+# Vision models in fallback order — gemini-2.5-flash is the new release
 DEFAULT_VISION_MODELS = [
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.0-flash",
     "gemini-1.5-flash",
-    "gemini-2.0-flash-exp",
     "gemini-1.5-pro",
 ]
 
@@ -93,8 +93,8 @@ LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT") or st.secrets.get("LANGSMITH_
 LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT") or st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 
 KEYS_CONFIGURED = (
-    GEMINI_API_KEY and "PASTE_YOUR" not in GEMINI_API_KEY and
-    PINECONE_API_KEY and "PASTE_YOUR" not in PINECONE_API_KEY
+    bool(GEMINI_API_KEY) and "PASTE_YOUR" not in GEMINI_API_KEY and
+    bool(PINECONE_API_KEY) and "PASTE_YOUR" not in PINECONE_API_KEY
 )
 
 VISION_CONFIGURED = bool(KEYS_CONFIGURED)
@@ -103,28 +103,24 @@ LANGSMITH_CONFIGURED = bool(
     LANGSMITH_SDK_AVAILABLE and LANGSMITH_API_KEY and "PASTE_YOUR" not in LANGSMITH_API_KEY
 )
 
-# ========================= PAGE CONFIG & CUSTOM CSS (THEME-SAFE) =========================
+# ========================= PAGE CONFIG & CUSTOM CSS =========================
 st.set_page_config(page_title="Neural RAG", page_icon="🧠", layout="wide")
 
 st.markdown("""
 <style>
-    /* Hide Streamlit default header, footer, and menu */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
 
-    /* Global font */
     html, body, [class*="css"] {
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
-    /* Use Streamlit's own theme variables so it works in BOTH light & dark mode */
     .stApp {
         background: var(--background-color, #ffffff);
         color: var(--text-color, #0f172a);
     }
 
-    /* Main header — gradient text works fine on any theme */
     .main-header {
         font-size: 2.8rem;
         font-weight: 800;
@@ -140,7 +136,6 @@ st.markdown("""
         margin-bottom: 1.5rem;
     }
 
-    /* Chat message styling — adapts to theme via secondary-background-color */
     div[data-testid="stChatMessage"] {
         background-color: var(--secondary-background-color, #f1f5f9);
         color: var(--text-color, #0f172a);
@@ -156,7 +151,6 @@ st.markdown("""
         color: var(--text-color, #0f172a) !important;
     }
 
-    /* Badges — fixed light backgrounds w/ dark text so they stay readable on any theme */
     .badge {
         display: inline-block;
         padding: 4px 12px;
@@ -170,7 +164,6 @@ st.markdown("""
     .trace-badge { background-color: #c7d2fe; color: #312e81; }
     .trace-badge a { color: #312e81 !important; font-weight: 700; }
 
-    /* Sidebar — adapts to theme */
     section[data-testid="stSidebar"] {
         background-color: var(--secondary-background-color, #f8fafc);
         border-right: 1px solid rgba(128,128,128,0.2);
@@ -182,7 +175,6 @@ st.markdown("""
         padding-top: 1.5rem;
     }
 
-    /* Buttons */
     .stButton > button {
         border-radius: 10px;
         font-weight: 600;
@@ -193,13 +185,11 @@ st.markdown("""
         box-shadow: 0 4px 12px rgba(0,0,0,0.2);
     }
 
-    /* Expander */
     .streamlit-expanderHeader {
         font-weight: 600;
         color: var(--text-color, #334155) !important;
     }
 
-    /* Chat input */
     [data-testid="stChatInput"] textarea {
         border-radius: 12px;
         border: 1px solid rgba(128,128,128,0.4);
@@ -207,7 +197,6 @@ st.markdown("""
         color: var(--text-color, #0f172a);
     }
 
-    /* Make sure markdown / json / code blocks stay legible on dark theme */
     .stMarkdown, .stJson, .stCode, .stText {
         color: var(--text-color, inherit);
     }
@@ -215,7 +204,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 if not KEYS_CONFIGURED:
-    st.error("⚠️ API keys are not configured yet. Please set `GEMINI_API_KEY` and `PINECONE_API_KEY` in the script.")
+    st.error("⚠️ API keys are not configured. Please set `GEMINI_API_KEY` and `PINECONE_API_KEY`.")
     st.stop()
 
 # ========================= LANGSMITH SETUP =========================
@@ -266,7 +255,7 @@ def load_reranker():
 embeddings = load_embeddings()
 reranker = load_reranker()
 
-# ========================= LLM FACTORIES (GEMINI) =========================
+# ========================= LLM FACTORIES =========================
 def get_llm(deterministic=True):
     return ChatGoogleGenerativeAI(
         model=GEMINI_MODEL,
@@ -275,31 +264,107 @@ def get_llm(deterministic=True):
     )
 
 def get_vision_llm(model_name):
-    """Return a ChatGoogleGenerativeAI instance for a specific Gemini model (natively multimodal)."""
+    """Return a ChatGoogleGenerativeAI instance for a specific Gemini vision model."""
     return ChatGoogleGenerativeAI(
         model=model_name,
         google_api_key=GEMINI_API_KEY,
         temperature=0.0,
     )
 
+# ========================= CONTENT EXTRACTION HELPER =========================
+def extract_text_from_content(content):
+    """
+    Safely extract a plain string from a Gemini response content.
+    content can be:
+      - a plain str
+      - a list of dicts like [{"type": "text", "text": "..."}, ...]
+      - a list of objects with a .text attribute
+      - any other structure
+    Returns a stripped string or None if nothing useful found.
+    """
+    if content is None:
+        return None
+
+    # Already a plain string
+    if isinstance(content, str):
+        text = content.strip()
+        return text if text else None
+
+    # List — common for multimodal Gemini responses
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # {"type": "text", "text": "..."} format
+                if item.get("type") == "text" and "text" in item:
+                    parts.append(str(item["text"]))
+                elif "text" in item:
+                    parts.append(str(item["text"]))
+                elif "content" in item:
+                    parts.append(str(item["content"]))
+            elif hasattr(item, "text"):
+                parts.append(str(item.text))
+            elif hasattr(item, "content"):
+                parts.append(str(item.content))
+            else:
+                try:
+                    parts.append(str(item))
+                except Exception:
+                    pass
+        combined = " ".join(p.strip() for p in parts if p.strip())
+        return combined if combined else None
+
+    # Object with .text attribute (e.g. some LangChain wrappers)
+    if hasattr(content, "text"):
+        text = str(content.text).strip()
+        return text if text else None
+
+    # Last resort
+    try:
+        text = str(content).strip()
+        return text if text else None
+    except Exception:
+        return None
+
 # ========================= VISION HELPER: TRY MULTIPLE MODELS =========================
 def try_vision_call(prompt_text, image_b64, image_ext, model_list):
-    """Try a list of Gemini vision-capable models in order. Returns (result, error_message)."""
+    """
+    Try a list of Gemini vision-capable models in order.
+    Returns (result_str, error_message).
+    Handles the case where result.content is a list (multimodal response).
+    """
     errors = []
     for model in model_list:
         try:
             llm_vision = get_vision_llm(model)
             message = HumanMessage(content=[
                 {"type": "text", "text": prompt_text},
-                {"type": "image_url", "image_url": {"url": f"data:image/{image_ext};base64,{image_b64}"}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/{image_ext};base64,{image_b64}"},
+                },
             ])
             result = llm_vision.invoke([message])
-            if result and result.content:
-                return result.content.strip(), None
+
+            if result is None:
+                errors.append(f"Model {model}: returned None response.")
+                continue
+
+            # ---- KEY FIX: content can be a list for multimodal responses ----
+            extracted = extract_text_from_content(result.content)
+
+            if extracted:
+                return extracted, None
             else:
-                errors.append(f"Model {model}: returned empty content.")
+                errors.append(f"Model {model}: returned empty or unparseable content. "
+                               f"Raw type={type(result.content).__name__}, "
+                               f"value={str(result.content)[:200]}")
+
         except Exception as e:
             errors.append(f"Model {model}: {str(e)}")
+
     return None, "\n".join(errors)
 
 # ========================= LEAKAGE UTILITIES =========================
@@ -320,7 +385,7 @@ def safe_int(x, default=None):
     except Exception:
         return default
 
-# ========================= IMAGE HELPERS (RESIZE / ENCODE) =========================
+# ========================= IMAGE HELPERS =========================
 def resize_image_for_vision(image_bytes, max_dim=1024):
     """Downscale large images before sending to the vision model."""
     if not PIL_AVAILABLE:
@@ -340,49 +405,60 @@ def resize_image_for_vision(image_bytes, max_dim=1024):
 def encode_image_b64(image_bytes):
     return base64.b64encode(image_bytes).decode("utf-8")
 
-# ========================= VISION MODEL CALLS (with fallback) =========================
+# ========================= VISION MODEL CALLS =========================
 def describe_image_generic(image_b64, image_ext, page, caption_hint="", model_list=None):
     """INGESTION-TIME: Describe image using fallback Gemini vision models."""
     if model_list is None:
         model_list = st.session_state.get("vision_model_list", DEFAULT_VISION_MODELS)
-    prompt_text = f"""Describe this image from page {page} of a document in full, factual
-detail for someone who cannot see it. Include: the type of visual (bar chart, line chart,
-pie chart, table-like image, diagram, photo, logo, etc.), any title, axis labels, legend
-entries, every visible numeric data point and what it corresponds to, and any other text
-printed in the image. Be precise with numbers — copy them exactly as shown, do not round
-or estimate. If this is not a data visualization (e.g., a logo or decorative photo), say
-so briefly instead of inventing data.
-{"A caption associated with this image in the document text reads: " + caption_hint if caption_hint else ""}"""
+    prompt_text = (
+        f"Describe this image from page {page} of a document in full, factual detail "
+        f"for someone who cannot see it. Include: the type of visual (bar chart, line chart, "
+        f"pie chart, table-like image, diagram, photo, logo, etc.), any title, axis labels, "
+        f"legend entries, every visible numeric data point and what it corresponds to, and "
+        f"any other text printed in the image. Be precise with numbers — copy them exactly "
+        f"as shown, do not round or estimate. If this is not a data visualization (e.g., a "
+        f"logo or decorative photo), say so briefly instead of inventing data."
+        + (f"\nA caption associated with this image reads: {caption_hint}" if caption_hint else "")
+    )
     return try_vision_call(prompt_text, image_b64, image_ext, model_list)
 
-def analyze_image_for_question(image_b64, image_ext, page, user_question, caption_hint="", model_list=None):
-    """QUERY-TIME: Re-examine image with the user's specific question, using fallback Gemini models."""
+def analyze_image_for_question(image_b64, image_ext, page, user_question,
+                                caption_hint="", model_list=None):
+    """QUERY-TIME: Re-examine image with the user's specific question."""
     if model_list is None:
         model_list = st.session_state.get("vision_model_list", DEFAULT_VISION_MODELS)
-    prompt_text = f"""You are looking directly at an image extracted from page {page} of a
-document. Answer the user's question using ONLY what is visually present in this image —
-chart type, title, axis labels, legend, every visible numeric data point, trend lines,
-layout/positioning, colors (if relevant to distinguishing categories), and any printed text.
-Be precise with numbers; do not round or estimate. If the image does not contain information
-relevant to the question, say so plainly instead of guessing.
-{"A caption/reference associated with this image reads: " + caption_hint if caption_hint else ""}
-
-User question: {user_question}"""
+    prompt_text = (
+        f"You are looking directly at an image extracted from page {page} of a document. "
+        f"Answer the user's question using ONLY what is visually present in this image — "
+        f"chart type, title, axis labels, legend, every visible numeric data point, trend "
+        f"lines, layout/positioning, colors (if relevant), and any printed text. "
+        f"Be precise with numbers; do not round or estimate. If the image does not contain "
+        f"information relevant to the question, say so plainly instead of guessing."
+        + (f"\nCaption/reference: {caption_hint}" if caption_hint else "")
+        + f"\n\nUser question: {user_question}"
+    )
     return try_vision_call(prompt_text, image_b64, image_ext, model_list)
 
 # ========================= IMAGE QUERY DETECTION =========================
-IMAGE_QUERY_KEYWORDS = ["figure", "fig.", "chart", "image", "diagram", "graph", "visual", "picture", "plot", "layout", "table"]
-FIGURE_REF_REGEX = re.compile(r'\b(figure|fig\.?|table|chart|diagram)\s*\.?\s*(\d+)\b', re.IGNORECASE)
+IMAGE_QUERY_KEYWORDS = [
+    "figure", "fig.", "chart", "image", "diagram",
+    "graph", "visual", "picture", "plot", "layout", "table"
+]
+FIGURE_REF_REGEX = re.compile(
+    r'\b(figure|fig\.?|table|chart|diagram)\s*\.?\s*(\d+)\b', re.IGNORECASE
+)
 
 def query_mentions_visual(query):
     q = query.lower()
     return any(k in q for k in IMAGE_QUERY_KEYWORDS) or bool(FIGURE_REF_REGEX.search(query))
 
-# ========================= TABLE / CAPTION EXTRACTION HELPERS =========================
-CAPTION_REGEX = re.compile(r'((?:Figure|Fig\.?|Table|Chart|Diagram)\s*\d+[:.\-]?\s*[^\n]{0,220})', re.IGNORECASE)
+# ========================= TABLE / CAPTION EXTRACTION =========================
+CAPTION_REGEX = re.compile(
+    r'((?:Figure|Fig\.?|Table|Chart|Diagram)\s*\d+[:.\-]?\s*[^\n]{0,220})',
+    re.IGNORECASE
+)
 
 def extract_page_captions(pdf_path):
-    """Scan each page's real text layer for figure/table caption lines."""
     captions_by_page = {}
     if not PYMUPDF_AVAILABLE:
         return captions_by_page
@@ -399,7 +475,6 @@ def extract_page_captions(pdf_path):
     return captions_by_page
 
 def extract_tables_as_markdown(pdf_path):
-    """Extract tables with row/column structure preserved (as markdown)."""
     if not PDFPLUMBER_AVAILABLE:
         return []
     table_chunks = []
@@ -430,7 +505,7 @@ def extract_tables_as_markdown(pdf_path):
         pass
     return table_chunks
 
-# ========================= IMAGE EXTRACTION + VISION DESCRIPTION (INGESTION) =========================
+# ========================= IMAGE EXTRACTION + VISION DESCRIPTION =========================
 def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True,
                                  max_vision_images=10, progress_cb=None):
     """Full ingestion-time image pipeline with fallback and error capture."""
@@ -455,7 +530,6 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                 except Exception:
                     continue
 
-                # Skip tiny images (icons/bullets/decorative dividers)
                 if len(image_bytes) < 3000:
                     continue
 
@@ -467,7 +541,9 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                 if use_vision and VISION_CONFIGURED and vision_calls_used < max_vision_images:
                     if progress_cb:
                         progress_cb(f"🖼️ Vision model analyzing image on page {page_num + 1}...")
-                    description, vision_error = describe_image_generic(b64, ext, page_num + 1, caption_text)
+                    description, vision_error = describe_image_generic(
+                        b64, ext, page_num + 1, caption_text
+                    )
                     vision_calls_used += 1
 
                 ocr_text = ""
@@ -479,12 +555,20 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                         ocr_text = ""
 
                 if description:
-                    text_block = f"[FIGURE/IMAGE on page {page_num + 1} — described via direct visual analysis]\n{description}"
+                    text_block = (
+                        f"[FIGURE/IMAGE on page {page_num + 1} — described via direct visual analysis]\n"
+                        f"{description}"
+                    )
                 elif ocr_text:
-                    text_block = f"[FIGURE/IMAGE on page {page_num + 1}] Extracted text/labels via OCR: {ocr_text}"
+                    text_block = (
+                        f"[FIGURE/IMAGE on page {page_num + 1}] "
+                        f"Extracted text/labels via OCR: {ocr_text}"
+                    )
                 else:
-                    text_block = (f"[FIGURE/IMAGE on page {page_num + 1}] No readable text or vision "
-                                  f"analysis could be extracted from this image.")
+                    text_block = (
+                        f"[FIGURE/IMAGE on page {page_num + 1}] No readable text or vision "
+                        f"analysis could be extracted from this image."
+                    )
 
                 if caption_text:
                     text_block += f"\nCaption/reference found on this page: {caption_text}"
@@ -497,7 +581,7 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
                     "image_ext": ext,
                     "caption_text": caption_text,
                     "vision_described": bool(description),
-                    "vision_error": vision_error,   # store error if any
+                    "vision_error": vision_error,
                 })
         doc.close()
     except Exception:
@@ -506,7 +590,6 @@ def extract_and_describe_images(pdf_path, captions_by_page=None, use_vision=True
 
 # ========================= KEYWORD-BOOST RETRIEVAL =========================
 def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
-    """If the user explicitly names a figure/table/chart number, force-include every chunk that mentions it."""
     matches_needed = FIGURE_REF_REGEX.findall(query)
     if not matches_needed:
         return []
@@ -514,7 +597,9 @@ def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
     boosted = []
     seen = set()
     for label, num in matches_needed:
-        pattern = re.compile(rf'{re.escape(label)}\.?\s*{re.escape(num)}\b', re.IGNORECASE)
+        pattern = re.compile(
+            rf'{re.escape(label)}\.?\s*{re.escape(num)}\b', re.IGNORECASE
+        )
         for item in all_chunks_data:
             if pattern.search(item["text"]):
                 key = item["text"][:60]
@@ -524,17 +609,21 @@ def keyword_boost_chunks(query, all_chunks_data, max_matches=8):
     return boosted[:max_matches]
 
 def boost_image_chunks(query, all_chunks_data, max_images=3):
-    """If the query mentions any visual term, add all image chunks to ensure they are considered."""
     q = query.lower()
     if not any(k in q for k in IMAGE_QUERY_KEYWORDS):
         return []
-
-    image_chunks = [item for item in all_chunks_data if item.get("type") == "image" and item.get("image_b64")]
+    image_chunks = [
+        item for item in all_chunks_data
+        if item.get("type") == "image" and item.get("image_b64")
+    ]
     image_chunks.sort(key=lambda x: x.get("page", 0))
     return image_chunks[:max_images]
 
-# ========================= VISUALIZATION (CHART RENDERING) HELPERS =========================
-VISUAL_KEYWORDS = ["chart", "plot", "visuali", "graph", "trend", "compare", "comparison", "vs", "versus"]
+# ========================= VISUALIZATION HELPERS =========================
+VISUAL_KEYWORDS = [
+    "chart", "plot", "visuali", "graph", "trend",
+    "compare", "comparison", "vs", "versus"
+]
 
 def wants_visualization(query):
     q = query.lower()
@@ -546,7 +635,10 @@ def extract_markdown_table(text):
         return None
     try:
         table_str = "\n".join(lines)
-        df = pd.read_csv(io_module.StringIO(table_str), sep="|", engine="python", skipinitialspace=True)
+        df = pd.read_csv(
+            io_module.StringIO(table_str), sep="|",
+            engine="python", skipinitialspace=True
+        )
         df = df.drop(df.columns[[0, -1]], axis=1)
         df = df.iloc[1:].reset_index(drop=True)
         df.columns = [str(c).strip() for c in df.columns]
@@ -587,7 +679,7 @@ class SemanticCache:
 
 
 class AdvancedContextBuilder:
-    """Sentence-level dedup + compression for PROSE, with a separate path for TABLE and IMAGE chunks."""
+    """Sentence-level dedup + compression for PROSE; separate path for TABLE and IMAGE chunks."""
     def __init__(self, cross_encoder):
         self.reranker = cross_encoder
 
@@ -609,11 +701,15 @@ class AdvancedContextBuilder:
             item_type = item.get("type", "text")
             page = item.get("page", "Unknown")
             if item_type in ("table", "image"):
-                whole_block_candidates.append({"text": item["text"], "page": page, "type": item_type})
+                whole_block_candidates.append({
+                    "text": item["text"], "page": page, "type": item_type
+                })
             else:
                 for s in nltk.sent_tokenize(item["text"]):
                     if len(s.strip()) > 20:
-                        sentence_candidates.append({"text": s.strip(), "page": page, "type": "text"})
+                        sentence_candidates.append({
+                            "text": s.strip(), "page": page, "type": "text"
+                        })
 
         unique_sentences, seen = [], set()
         for item in sentence_candidates:
@@ -630,11 +726,15 @@ class AdvancedContextBuilder:
             scores = self.reranker.predict(pairs)
             ranked = sorted(zip(scores, unique_sentences), key=lambda x: x[0], reverse=True)
             top_k = ranked[:max_sentences]
-            score_log = [(float(s), item["text"][:80]) for s, item in top_k] if debug_scores else []
+            score_log = [
+                (float(s), item["text"][:80]) for s, item in top_k
+            ] if debug_scores else []
 
             if top_k:
                 best_score = top_k[0][0]
-                filtered_sentences = [item for score, item in top_k if score > best_score - relative_gap]
+                filtered_sentences = [
+                    item for score, item in top_k if score > best_score - relative_gap
+                ]
                 if not filtered_sentences:
                     filtered_sentences = [item for _, item in top_k[:min_sentences_floor]]
 
@@ -650,11 +750,15 @@ class AdvancedContextBuilder:
 
             block_pairs = [[query, b["text"][:2000]] for b in dedup_blocks]
             block_scores = self.reranker.predict(block_pairs)
-            ranked_full = sorted(zip(block_scores, dedup_blocks), key=lambda x: x[0], reverse=True)
+            ranked_full = sorted(
+                zip(block_scores, dedup_blocks), key=lambda x: x[0], reverse=True
+            )
             top_blocks = ranked_full[:max_blocks]
             if top_blocks:
                 best_block_score = top_blocks[0][0]
-                ranked_blocks = [b for s, b in top_blocks if s > best_block_score - relative_gap]
+                ranked_blocks = [
+                    b for s, b in top_blocks if s > best_block_score - relative_gap
+                ]
                 if not ranked_blocks:
                     ranked_blocks = [b for _, b in top_blocks[:2]]
 
@@ -673,7 +777,6 @@ class AdvancedContextBuilder:
 # ========================= PARENT/NEIGHBOR EXPANSION =========================
 @traceable(run_type="tool", name="Neighbor Expansion (Parent Document)")
 def expand_with_neighbors(top_docs, all_chunks_data, window=1):
-    """Pulls in adjacent chunks for context continuity. Uses FULL local record."""
     selected = {}
     for doc in top_docs:
         raw_idx = doc.metadata.get("chunk_index")
@@ -685,9 +788,13 @@ def expand_with_neighbors(top_docs, all_chunks_data, window=1):
         if idx is not None and 0 <= idx < len(all_chunks_data):
             selected[idx] = all_chunks_data[idx]
         elif idx is not None:
-            selected[idx] = {"text": text, "page": page, "chunk_index": idx, "type": item_type}
+            selected[idx] = {
+                "text": text, "page": page, "chunk_index": idx, "type": item_type
+            }
         else:
-            selected[f"raw_{len(selected)}"] = {"text": text, "page": page, "chunk_index": -1, "type": item_type}
+            selected[f"raw_{len(selected)}"] = {
+                "text": text, "page": page, "chunk_index": -1, "type": item_type
+            }
 
         if idx is not None:
             for offset in range(1, window + 1):
@@ -707,9 +814,15 @@ def expand_with_neighbors(top_docs, all_chunks_data, window=1):
 def compute_consistency(responses):
     if len(responses) < 2:
         return 1.0
-    vecs = np.array([embeddings.embed_query(r) for r in responses], dtype=np.float32)
+    vecs = np.array(
+        [embeddings.embed_query(r) for r in responses], dtype=np.float32
+    )
     faiss.normalize_L2(vecs)
-    sims = [float(np.dot(vecs[i], vecs[j])) for i in range(len(vecs)) for j in range(i + 1, len(vecs))]
+    sims = [
+        float(np.dot(vecs[i], vecs[j]))
+        for i in range(len(vecs))
+        for j in range(i + 1, len(vecs))
+    ]
     return float(np.mean(sims)) if sims else 1.0
 
 
@@ -733,8 +846,15 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
     except Exception:
         pass
 
-    run_tags = ["deterministic" if deterministic else "sampled", f"chat:{chat['namespace']}"]
-    run_metadata = {"chat_id": chat["namespace"], "doc_name": chat.get("doc_name"), "use_cache": use_cache}
+    run_tags = [
+        "deterministic" if deterministic else "sampled",
+        f"chat:{chat['namespace']}"
+    ]
+    run_metadata = {
+        "chat_id": chat["namespace"],
+        "doc_name": chat.get("doc_name"),
+        "use_cache": use_cache
+    }
 
     llm = get_llm(deterministic=deterministic)
 
@@ -747,26 +867,42 @@ def run_rag_pipeline(query, chat, deterministic=True, use_cache=True, status=Non
             return response, debug
 
     log("Decomposing question into sub-queries...")
-    mq_prompt = f"""Break this question into up to 3 simpler, self-contained sub-questions
-that together would let you fully answer it (useful for "how does X connect to Y" or
-multi-part questions spanning different sections, tables, or figures). Output ONLY the
-sub-questions, one per line, no numbering, no extra text.
-Question: {query}"""
+    mq_prompt = (
+        f"Break this question into up to 3 simpler, self-contained sub-questions "
+        f"that together would let you fully answer it. Output ONLY the sub-questions, "
+        f"one per line, no numbering, no extra text.\nQuestion: {query}"
+    )
     try:
         raw_sub = llm.invoke(
             mq_prompt,
-            config={"tags": run_tags + ["query-decomposition"], "metadata": run_metadata,
-                    "run_name": "Query Decomposition"}
+            config={
+                "tags": run_tags + ["query-decomposition"],
+                "metadata": run_metadata,
+                "run_name": "Query Decomposition"
+            }
         ).content
-        sub_queries = [s.strip("-• ").strip() for s in raw_sub.splitlines() if s.strip()][:3]
+
+        # Safe extraction in case content is a list
+        if isinstance(raw_sub, list):
+            raw_sub = extract_text_from_content(raw_sub) or ""
+
+        sub_queries = [
+            s.strip("-• ").strip()
+            for s in str(raw_sub).splitlines()
+            if s.strip()
+        ][:3]
     except Exception:
         sub_queries = []
     sub_queries.append(query)
     debug["sub_queries"] = sub_queries
 
     retriever = PineconeHybridSearchRetriever(
-        embeddings=embeddings, sparse_encoder=chat["bm25_encoder"],
-        index=chat["pinecone_index"], alpha=0.5, top_k=10, namespace=chat["namespace"]
+        embeddings=embeddings,
+        sparse_encoder=chat["bm25_encoder"],
+        index=chat["pinecone_index"],
+        alpha=0.5,
+        top_k=10,
+        namespace=chat["namespace"]
     )
 
     log("Retrieving across all sub-questions...")
@@ -776,8 +912,11 @@ Question: {query}"""
             all_retrieved.extend(
                 retriever.invoke(
                     sq,
-                    config={"tags": run_tags + ["hybrid-retrieval"], "metadata": run_metadata,
-                            "run_name": "Hybrid Retrieval"}
+                    config={
+                        "tags": run_tags + ["hybrid-retrieval"],
+                        "metadata": run_metadata,
+                        "run_name": "Hybrid Retrieval"
+                    }
                 )
             )
         except Exception:
@@ -787,29 +926,40 @@ Question: {query}"""
     retrieved = list(unique_docs.values())
 
     if not retrieved:
-        # Still try to boost image chunks if visual query
         boosted_only = keyword_boost_chunks(query, chat["all_chunks_data"])
         if not boosted_only and query_mentions_visual(query):
             boosted_only = boost_image_chunks(query, chat["all_chunks_data"])
         if not boosted_only:
-            return "I don't have enough information in the document to answer that.", debug
+            return (
+                "I don't have enough information in the document to answer that.",
+                debug
+            )
         expanded_items = boosted_only
         debug["keyword_boosted"] = [b["text"][:120] for b in boosted_only]
     else:
         log("Reranking with cross-encoder...")
         doc_texts = [doc.page_content for doc in retrieved]
         scores = reranker.predict([[query, t] for t in doc_texts])
-        top_docs = [d for _, d in sorted(zip(scores, retrieved), key=lambda x: x[0], reverse=True)[:8]]
-
-        debug["retrieved_pages"] = [
-            {"page": d.metadata.get("page", "?"), "chunk_index": d.metadata.get("chunk_index", "?"),
-             "type": d.metadata.get("type", "text"), "preview": d.page_content[:120] + "..."} for d in top_docs
+        top_docs = [
+            d for _, d in sorted(
+                zip(scores, retrieved), key=lambda x: x[0], reverse=True
+            )[:8]
         ]
 
-        log("Expanding with neighboring context (parent-document retrieval)...")
+        debug["retrieved_pages"] = [
+            {
+                "page": d.metadata.get("page", "?"),
+                "chunk_index": d.metadata.get("chunk_index", "?"),
+                "type": d.metadata.get("type", "text"),
+                "preview": d.page_content[:120] + "..."
+            }
+            for d in top_docs
+        ]
+
+        log("Expanding with neighboring context...")
         expanded_items = expand_with_neighbors(top_docs, chat["all_chunks_data"], window=1)
 
-        log("Checking for explicitly named figures/tables to force-include...")
+        log("Checking for explicitly named figures/tables...")
         boosted = keyword_boost_chunks(query, chat["all_chunks_data"])
         if boosted:
             existing_keys = {item["text"][:60] for item in expanded_items}
@@ -819,7 +969,6 @@ Question: {query}"""
                     existing_keys.add(b["text"][:60])
             debug["keyword_boosted"] = [b["text"][:120] for b in boosted]
 
-        # NEW: For any visual query, add image chunks directly
         if query_mentions_visual(query):
             image_boost = boost_image_chunks(query, chat["all_chunks_data"])
             existing_keys = {item["text"][:60] for item in expanded_items}
@@ -832,42 +981,66 @@ Question: {query}"""
 
     # ---- QUERY-TIME TARGETED VISION RE-ANALYSIS ----
     vision_context_blocks = []
-    if VISION_CONFIGURED and st.session_state.get("enable_vision", True) and query_mentions_visual(query):
-        image_candidates = [it for it in expanded_items if it.get("type") == "image" and it.get("image_b64")]
+    if (
+        VISION_CONFIGURED
+        and st.session_state.get("enable_vision", True)
+        and query_mentions_visual(query)
+    ):
+        image_candidates = [
+            it for it in expanded_items
+            if it.get("type") == "image" and it.get("image_b64")
+        ]
 
-        # Store image display info for inline viewing
         debug["image_display"] = [
-            {"page": img.get("page"), "image_b64": img["image_b64"], "caption_text": img.get("caption_text", "")}
+            {
+                "page": img.get("page"),
+                "image_b64": img["image_b64"],
+                "caption_text": img.get("caption_text", "")
+            }
             for img in image_candidates[:2]
         ]
 
         for img_item in image_candidates[:3]:
             log(f"👁️ Running targeted vision analysis on figure (page {img_item.get('page')})...")
             analysis, error = analyze_image_for_question(
-                img_item["image_b64"], img_item.get("image_ext", "png"),
-                img_item.get("page"), query, img_item.get("caption_text", "")
+                img_item["image_b64"],
+                img_item.get("image_ext", "png"),
+                img_item.get("page"),
+                query,
+                img_item.get("caption_text", "")
             )
             if analysis:
                 vision_context_blocks.append(
                     f"[VISION MODEL ANALYSIS of figure/image on page {img_item.get('page')} — "
-                    f"generated by directly viewing this image to answer the current question]\n{analysis}"
+                    f"generated by directly viewing this image to answer the current question]\n"
+                    f"{analysis}"
                 )
             else:
-                debug["vision_errors"].append(f"Vision analysis error for page {img_item.get('page')}: {error}")
+                debug["vision_errors"].append(
+                    f"Vision analysis error for page {img_item.get('page')}: {error}"
+                )
     debug["vision_analyses"] = vision_context_blocks
 
-    log("Compressing & deduplicating context (tables/images kept intact)...")
+    log("Compressing & deduplicating context...")
     context_builder = AdvancedContextBuilder(reranker)
     compressed_text, score_log = context_builder.build_and_compress(
-        expanded_items, query, max_sentences=22, debug_scores=(status is not None)
+        expanded_items, query,
+        max_sentences=22,
+        debug_scores=(status is not None)
     )
     debug["compressed_text"] = compressed_text
     debug["compression_scores"] = score_log
 
-    if not compressed_text or not compressed_text.strip() or compressed_text == "No relevant context found.":
+    if (
+        not compressed_text
+        or not compressed_text.strip()
+        or compressed_text == "No relevant context found."
+    ):
         log("⚠️ Compression returned empty — falling back to raw top chunks.")
         fallback_texts = [item["text"] for item in expanded_items[:8]]
-        compressed_text = "\n".join(fallback_texts) if fallback_texts else "No relevant context found."
+        compressed_text = (
+            "\n".join(fallback_texts) if fallback_texts else "No relevant context found."
+        )
         debug["compressed_text"] = compressed_text
 
     context_pieces = []
@@ -888,163 +1061,65 @@ The Context Data may contain FOUR kinds of content, each marked accordingly:
 - Plain prose text (no special marker)
 - Tables, marked "[TABLE from page X]" followed by a markdown table
 - Figure/image descriptions generated at ingestion time, marked
-  "[FIGURE/IMAGE on page X — described via direct visual analysis]" (or, if
-  vision analysis wasn't available for that image, OCR text or a plain
-  "[FIGURE/IMAGE on page X]" marker with only a caption)
+  "[FIGURE/IMAGE on page X — described via direct visual analysis]"
 - Vision model analyses generated specifically for THIS question, marked
   "[VISION MODEL ANALYSIS of figure/image on page X — generated by directly
-  viewing this image to answer the current question]" — this is the model
-  literally looking at the image right now to answer what was asked.
+  viewing this image to answer the current question]"
 
 ====================================================================
 SECTION 1 — CORE GROUNDING PRINCIPLE
 ====================================================================
-
 - Use ONLY the information explicitly present in the Context Data below.
-- Do not use outside knowledge, training data, assumptions, or general world
-  knowledge about the topic — even if you "know" the correct answer.
-- Do not fill gaps with plausible-sounding information.
-- Numbers, dates, names, and figures must be copied or paraphrased exactly as
-  they appear. Never round, estimate, recalculate, or "correct" a number —
-  except where Section 2B explicitly asks you to compute a derived value.
+- Do not use outside knowledge, training data, or assumptions.
+- Numbers, dates, names, and figures must be copied or paraphrased exactly.
 
 ====================================================================
-SECTION 2 — CLASSIFY THE QUESTION FIRST (internally, do not show this step)
+SECTION 2 — QUESTION CLASSIFICATION (internally, do not show this step)
 ====================================================================
-
-1. OVERVIEW / SUMMARY → synthesize themes across the entire Context Data.
-2. SPECIFIC FACTUAL → answer from the single most relevant passage/table/figure.
-3. RELATIONSHIP / CAUSAL → only state a relationship if explicitly described.
-4. LIST / ENUMERATION → extract all explicitly stated relevant items only.
-5. COMPARISON → only compare attributes explicitly stated for both items.
-6. YES/NO or VERIFICATION → answer directly, then support with a paraphrase.
-7. MULTI-PART → address each part separately; state which parts aren't covered.
-8. DEFINITION / EXPLANATION → give a definition or explanation based on Context Data.
-9. MATH / CALCULATION → if the question asks for arithmetic, compute from numbers
-   found in the Context Data and show the steps.
-10. CODE / EXTRACTION → if the question asks for code, reproduce it exactly as it
-   appears in the Context Data; do not modify or reformat.
-
-Also apply Section 2B whenever the question involves tables, figures/images,
-numeric comparisons, calculations, or visualization requests.
+Classify as one of: OVERVIEW/SUMMARY, SPECIFIC FACTUAL, RELATIONSHIP/CAUSAL,
+LIST/ENUMERATION, COMPARISON, YES/NO, MULTI-PART, DEFINITION, MATH/CALCULATION,
+CODE/EXTRACTION. Then apply Section 2B for data/table/image questions.
 
 ====================================================================
-SECTION 2B — DATA, TABLE & IMAGE REASONING (perform internally, silently)
+SECTION 2B — DATA, TABLE & IMAGE REASONING
 ====================================================================
-
-A. TABLE-GROUNDED QUESTIONS
-   1. Locate every table row/column relevant to the entities in the question.
-   2. Extract exact values — never approximate or infer a missing cell.
-   3. Compute derived results (difference, sum, %, ranking, trend) yourself
-      from extracted values, and SHOW the numbers used.
-   4. If a needed value is missing from every table, say so explicitly.
-   5. Reproduce relevant figures as a compact markdown table when the
-      question involves 3+ data points or an explicit comparison.
-
-B. IMAGE / FIGURE-GROUNDED QUESTIONS — CRITICAL RULES:
-   - If a "[VISION MODEL ANALYSIS ...]" block is present for the figure being
-     asked about, treat it as AUTHORITATIVE, DIRECT VISUAL OBSERVATION. You
-     may describe its layout, chart type, axis labels, trends, and every
-     number it reports as established fact — there is no need to hedge about
-     "not being able to see the image," because the vision analysis IS you
-     having looked at it. Answer fully and confidently using that block.
-   - If NO vision analysis block is present for the relevant figure, but a
-     "[FIGURE/IMAGE ... described via direct visual analysis]" block from
-     ingestion exists, use that description the same way — it also came from
-     directly viewing the image.
-   - Only fall back to a limitation statement (e.g., "the exact visual layout
-     of this image isn't available") when NEITHER a vision analysis block NOR
-     a vision-described ingestion block exists for that specific figure —
-     i.e., only plain OCR text or a "no text detected" placeholder is present.
-     Even then, still use any caption or surrounding prose/table data that
-     relates to the same figure before saying anything is unanswerable.
-   - Never invent visual details not stated in any of these blocks.
-
-C. VISUALIZATION REQUESTS ("show me a chart", "visualize this", "plot the
-   trend", "graph the comparison")
-   - Produce the most chart-ready markdown table of the requested data,
-     followed by a short written interpretation of the pattern.
-   - ALWAYS put the data table BEFORE the interpretation.
-   - If requested data spans values not present in the Context Data, build
-     the table only from what's available and note what's missing.
-
-D. MULTI-STEP ANALYTICAL QUESTIONS (comparisons, trends, calculations
-   spanning multiple data points, tables, figures, or sections)
-   - Steps: (1) identify required data points, (2) locate each in the
-     Context Data (including vision analysis blocks), (3) note any missing,
-     (4) compute as needed, (5) synthesize a plain-language conclusion.
-   - Combining individually-stated values from different tables/figures/pages
-     to answer a comparison or calculation IS correct and expected.
-   - Only say data is unavailable when a specific required number is
-     genuinely absent from all retrieved content, including vision blocks.
+A. TABLE: Extract exact values, compute derived results, show numbers used.
+B. IMAGE/FIGURE: If a VISION MODEL ANALYSIS block exists, treat it as
+   authoritative direct observation. Answer fully and confidently.
+   Only hedge when neither a vision analysis nor vision-described ingestion
+   block exists for the specific figure.
+C. VISUALIZATION REQUESTS: Produce chart-ready markdown table FIRST, then
+   written interpretation.
+D. MULTI-STEP ANALYTICAL: Identify data points, locate each, note missing,
+   compute as needed, synthesize conclusion.
 
 ====================================================================
 SECTION 3 — ANTI-HALLUCINATION SAFEGUARDS
 ====================================================================
-
-- Never guess a relationship, cause, or connection not explicitly written
-  in the Context Data.
-- Never blend two distant, unrelated PROSE claims into one fabricated
-  statement (numeric computation across tables/figures per Section 2B-D is exempt).
-- If the Context Data is ambiguous or contradictory, report that plainly.
-- Do not extrapolate beyond what is directly stated or directly computable.
-- If a name, number, or term is not explicitly present anywhere in the
-  Context Data (including vision blocks), do not introduce it.
+- Never guess relationships not explicitly written in Context Data.
+- If Context Data is ambiguous or contradictory, report that plainly.
+- Do not extrapolate beyond what is directly stated or computable.
 
 ====================================================================
-SECTION 4 — HANDLING INSUFFICIENT OR PARTIAL INFORMATION
+SECTION 4 — HANDLING INSUFFICIENT INFORMATION
 ====================================================================
-
-- Full refusal ("I don't have enough information in the document to answer
-  that.") is ONLY appropriate when the Context Data contains ABSOLUTELY
-  NOTHING relevant — not even a related caption, vision analysis, statistic,
-  or description of the same topic.
-- If the Context Data contains SOME relevant information, use it. Provide
-  what is supported, and explicitly state which specific part remains
-  unanswered.
-- Never treat "OCR found no text" as equivalent to "no information exists" —
-  check for vision analysis blocks and surrounding context first, every time.
-- Never pad an incomplete answer with speculation.
+- Full refusal is ONLY appropriate when Context Data contains NOTHING relevant.
+- If SOME relevant information exists, use it and state what's missing.
 
 ====================================================================
-SECTION 5 — OUTPUT FORMATTING RULES
+SECTION 5 — OUTPUT FORMATTING
 ====================================================================
-
-- Write in clear, natural, professional prose.
-- NEVER output raw internal formatting artifacts: arrows (→), special bullet
-  symbols (•), placeholder labels ("Chunk 1", "Passage A"), internal IDs.
-- Do not include page numbers, section IDs, or citation tags.
-- Plain numbered lists ("1.", "2.") are fine; decorative bullet symbols are not.
-- EXCEPTION — TABLES ARE REQUIRED, NOT LEAKAGE: when comparing 3+ values,
-  numeric trends, or responding to a chart/visualization/comparison request,
-  include a clean markdown table of the relevant figures BEFORE your written
-  explanation, using standard `| Column | Column |` syntax.
+- Clear, natural, professional prose.
+- No raw internal formatting: no arrows, special bullets, placeholder labels.
+- Plain numbered lists are fine; decorative symbols are not.
+- Include markdown tables for 3+ value comparisons or visualization requests.
 
 ====================================================================
 SECTION 6 — TONE AND STYLE
 ====================================================================
-
-- Be direct and confident when the Context Data (including vision analysis)
-  clearly supports the answer.
-- Be transparent when only partially supported.
-- Avoid filler, over-hedging, or repeating the question.
-- Match answer length/detail to question complexity.
-
-====================================================================
-SECTION 7 — FINAL SELF-CHECK (perform silently before responding)
-====================================================================
-
-1. Did I check for a vision analysis block before treating a figure as
-   unanswerable?
-2. Is every claim directly traceable to the Context Data (computations shown)?
-3. Have I avoided connecting unrelated prose passages without textual basis?
-4. Have I removed all raw symbols, internal labels, citation markers?
-5. If something is missing, have I said so explicitly rather than refusing
-   the whole question?
-6. If tables/figures/comparisons/visualization were involved, did I include
-   a markdown table before my explanation?
-
-Only output the final answer — never show this checklist to the user.
+- Direct and confident when Context Data clearly supports the answer.
+- Transparent when only partially supported.
+- Match answer length to question complexity.
 
 ====================================================================
 QUESTION
@@ -1060,11 +1135,21 @@ CONTEXT DATA
 Now provide the final answer, following all rules above.
 
 Answer:"""
-    raw_response = llm.invoke(
+
+    raw_response_obj = llm.invoke(
         final_prompt,
-        config={"tags": run_tags + ["final-synthesis"], "metadata": run_metadata,
-                "run_name": "Final Answer Synthesis"}
-    ).content
+        config={
+            "tags": run_tags + ["final-synthesis"],
+            "metadata": run_metadata,
+            "run_name": "Final Answer Synthesis"
+        }
+    )
+
+    # Safe content extraction — handles str or list content
+    raw_response = extract_text_from_content(raw_response_obj.content)
+    if not raw_response:
+        raw_response = "I was unable to generate a response. Please try again."
+
     response = clean_leakage(raw_response)
 
     if use_cache:
@@ -1091,7 +1176,10 @@ def create_new_chat(name=None):
 
 if "chats" not in st.session_state:
     st.session_state.chats = {}
-if "current_chat_id" not in st.session_state or st.session_state.current_chat_id not in st.session_state.chats:
+if (
+    "current_chat_id" not in st.session_state
+    or st.session_state.current_chat_id not in st.session_state.chats
+):
     st.session_state.current_chat_id = create_new_chat("Chat 1")
 
 st.session_state.setdefault("deterministic_mode", True)
@@ -1107,11 +1195,16 @@ def wait_for_index_ready(pc, index_name, timeout=90):
     while True:
         desc = pc.describe_index(index_name)
         status = desc.status if hasattr(desc, "status") else desc.get("status", {})
-        ready = status.get("ready") if isinstance(status, dict) else getattr(status, "ready", False)
+        ready = (
+            status.get("ready") if isinstance(status, dict)
+            else getattr(status, "ready", False)
+        )
         if ready:
             return True
         if time.time() - start > timeout:
-            raise TimeoutError(f"Pinecone index '{index_name}' did not become ready in time.")
+            raise TimeoutError(
+                f"Pinecone index '{index_name}' did not become ready in time."
+            )
         time.sleep(1)
 
 # ========================= SIDEBAR =========================
@@ -1126,16 +1219,21 @@ with st.sidebar:
         col1, col2 = st.columns([5, 1])
         with col1:
             label = ("📄 " if cdata["pdf_processed"] else "🗒️ ") + cdata["name"]
-            if st.button(label, key=f"select_{cid}", use_container_width=True,
-                         type="primary" if cid == st.session_state.current_chat_id else "secondary"):
+            if st.button(
+                label, key=f"select_{cid}", use_container_width=True,
+                type="primary" if cid == st.session_state.current_chat_id else "secondary"
+            ):
                 st.session_state.current_chat_id = cid
                 st.rerun()
         with col2:
             if st.button("🗑️", key=f"del_{cid}"):
                 del st.session_state.chats[cid]
-                if not st.session_state.chats: create_new_chat("Chat 1")
+                if not st.session_state.chats:
+                    create_new_chat("Chat 1")
                 if st.session_state.current_chat_id == cid:
-                    st.session_state.current_chat_id = list(st.session_state.chats.keys())[0]
+                    st.session_state.current_chat_id = list(
+                        st.session_state.chats.keys()
+                    )[0]
                 st.rerun()
 
     chat = st.session_state.chats[st.session_state.current_chat_id]
@@ -1143,15 +1241,18 @@ with st.sidebar:
     st.divider()
     st.markdown("<h2>⚙️ Settings</h2>", unsafe_allow_html=True)
     st.session_state.deterministic_mode = st.checkbox(
-        "Deterministic mode (temperature=0)", value=st.session_state.deterministic_mode,
+        "Deterministic mode (temperature=0)",
+        value=st.session_state.deterministic_mode,
         help="Keep ON so the same question always gives the same answer."
     )
     st.session_state.use_cache = st.checkbox(
-        "Enable semantic cache", value=st.session_state.use_cache,
-        help="Turn OFF while debugging consistency — cache hits can mask real pipeline behavior."
+        "Enable semantic cache",
+        value=st.session_state.use_cache,
+        help="Turn OFF while debugging — cache hits can mask real pipeline behavior."
     )
     st.session_state.show_debug = st.checkbox(
-        "Show debug info (retrieval / context)", value=st.session_state.show_debug
+        "Show debug info (retrieval / context)",
+        value=st.session_state.show_debug
     )
     if st.button("🧹 Clear Semantic Cache (this chat)"):
         chat["semantic_cache"] = SemanticCache(embeddings)
@@ -1162,36 +1263,36 @@ with st.sidebar:
     if PYMUPDF_AVAILABLE and VISION_CONFIGURED:
         st.success("✅ Vision pipeline available (Gemini multimodal)")
     elif not PYMUPDF_AVAILABLE:
-        st.warning("Install `pymupdf` to enable image extraction: `pip install pymupdf`")
+        st.warning("Install `pymupdf` to enable image extraction.")
     else:
         st.warning("Vision requires a configured GEMINI_API_KEY.")
 
     st.session_state.enable_vision = st.checkbox(
         "Enable vision-based image understanding",
         value=st.session_state.enable_vision,
-        help="Uses Gemini's native multimodal capability to actually look at extracted images/figures."
+        help="Uses Gemini's native multimodal capability to look at extracted images/figures."
     )
     with st.expander("Advanced vision settings"):
-        # Let user edit the model list (one per line)
         current_models = "\n".join(st.session_state.vision_model_list)
         new_models = st.text_area(
             "Gemini model names (one per line, tried in order)",
             value=current_models,
-            height=100,
+            height=120,
             key="vision_model_list_editor"
         )
         if new_models != current_models:
-            st.session_state.vision_model_list = [m.strip() for m in new_models.splitlines() if m.strip()]
+            st.session_state.vision_model_list = [
+                m.strip() for m in new_models.splitlines() if m.strip()
+            ]
 
         st.session_state.max_vision_images = st.slider(
-            "Max images to analyze with vision at ingestion", 1, 25, st.session_state.max_vision_images,
-            help="Caps vision API calls during document processing to control cost/time."
+            "Max images to analyze with vision at ingestion",
+            1, 25, st.session_state.max_vision_images,
+            help="Caps vision API calls during document processing."
         )
 
-        # Test button
         if st.button("🔍 Test Vision Model", use_container_width=True):
             with st.spinner("Testing vision model..."):
-                # Create a simple test image (a colored square with text)
                 if PIL_AVAILABLE:
                     img = Image.new('RGB', (200, 100), color=(73, 109, 137))
                     draw = ImageDraw.Draw(img)
@@ -1201,7 +1302,10 @@ with st.sidebar:
                     test_img_b64 = encode_image_b64(buf.getvalue())
                     test_ext = "png"
                     test_prompt = "Describe what you see in this image."
-                    result, err = try_vision_call(test_prompt, test_img_b64, test_ext, st.session_state.vision_model_list)
+                    result, err = try_vision_call(
+                        test_prompt, test_img_b64, test_ext,
+                        st.session_state.vision_model_list
+                    )
                     if result:
                         st.success("✅ Vision model works! Response:")
                         st.write(result)
@@ -1212,25 +1316,23 @@ with st.sidebar:
                     st.error("Pillow not installed, cannot create test image.")
 
     if PYMUPDF_AVAILABLE and not OCR_AVAILABLE:
-        st.info("OCR fallback not installed — that's fine as long as vision is enabled.")
+        st.info("OCR fallback not installed — fine if vision is enabled.")
     if PDFPLUMBER_AVAILABLE:
         st.success("✅ Table extraction enabled (pdfplumber)")
     else:
-        st.warning("Table extraction disabled — run `pip install pdfplumber` to enable.")
+        st.warning("Table extraction disabled — run `pip install pdfplumber`.")
 
     st.divider()
     st.markdown("<h2>🔎 LangSmith Tracing</h2>", unsafe_allow_html=True)
     if not LANGSMITH_SDK_AVAILABLE:
-        st.warning("`langsmith` package not installed. Run `pip install -U langsmith`.")
+        st.warning("`langsmith` package not installed.")
     elif not LANGSMITH_CONFIGURED:
-        st.warning(
-            "LangSmith API key not configured. Set `LANGSMITH_API_KEY` (and optionally "
-            "`LANGSMITH_PROJECT`) as an env var or Streamlit secret to enable tracing."
-        )
+        st.warning("LangSmith API key not configured.")
     else:
         toggled = st.checkbox(
-            "Enable tracing", value=st.session_state.langsmith_tracing_enabled,
-            help="Sends every LLM call, retrieval, and pipeline step to LangSmith for inspection."
+            "Enable tracing",
+            value=st.session_state.langsmith_tracing_enabled,
+            help="Sends every LLM call and pipeline step to LangSmith."
         )
         if toggled != st.session_state.langsmith_tracing_enabled:
             st.session_state.langsmith_tracing_enabled = toggled
@@ -1239,18 +1341,24 @@ with st.sidebar:
 
         if st.session_state.langsmith_tracing_enabled:
             st.success(f"✅ Tracing ON · Project: `{LANGSMITH_PROJECT}`")
-            st.markdown(f"[🔗 Open LangSmith Project Dashboard](https://smith.langchain.com/)")
+            st.markdown("[🔗 Open LangSmith Project Dashboard](https://smith.langchain.com/)")
         else:
             st.info("Tracing is currently OFF.")
 
     st.divider()
     st.markdown("<h2>🛠️ Document Setup</h2>", unsafe_allow_html=True)
 
-    new_name = st.text_input("Chat name", value=chat["name"], key=f"name_{st.session_state.current_chat_id}")
+    new_name = st.text_input(
+        "Chat name", value=chat["name"],
+        key=f"name_{st.session_state.current_chat_id}"
+    )
     if new_name and new_name != chat["name"]:
         chat["name"] = new_name
 
-    uploaded_file = st.file_uploader("Upload PDF", type="pdf", key=f"upload_{st.session_state.current_chat_id}")
+    uploaded_file = st.file_uploader(
+        "Upload PDF", type="pdf",
+        key=f"upload_{st.session_state.current_chat_id}"
+    )
 
     if st.button("Process Document", type="primary", disabled=uploaded_file is None):
         tmp_path = None
@@ -1265,18 +1373,24 @@ with st.sidebar:
                 if not docs:
                     raise ValueError("No content could be extracted from the PDF.")
 
-                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000, chunk_overlap=200
+                )
                 chunks = splitter.split_documents(docs)
 
                 text_items = [
-                    {"text": c.page_content, "page": c.metadata.get("page", 0) + 1, "type": "text"}
+                    {
+                        "text": c.page_content,
+                        "page": c.metadata.get("page", 0) + 1,
+                        "type": "text"
+                    }
                     for c in chunks
                 ]
 
-                if PDFPLUMBER_AVAILABLE:
-                    table_items = extract_tables_as_markdown(tmp_path)
-                else:
-                    table_items = []
+                table_items = (
+                    extract_tables_as_markdown(tmp_path)
+                    if PDFPLUMBER_AVAILABLE else []
+                )
 
                 page_captions = {}
                 image_items = []
@@ -1287,11 +1401,14 @@ with st.sidebar:
                         captions_by_page=page_captions,
                         use_vision=st.session_state.enable_vision,
                         max_vision_images=st.session_state.max_vision_images,
-                        progress_cb=None,  # silent
+                        progress_cb=None,
                     )
 
-                vision_count = sum(1 for it in image_items if it.get("vision_described"))
-                vision_errors_during_ingest = [it.get("vision_error") for it in image_items if it.get("vision_error")]
+                vision_errors_during_ingest = [
+                    it.get("vision_error")
+                    for it in image_items
+                    if it.get("vision_error")
+                ]
 
                 all_items = text_items + table_items + image_items
                 for idx, item in enumerate(all_items):
@@ -1302,15 +1419,16 @@ with st.sidebar:
                 bm25 = BM25Encoder().default()
                 bm25.fit(texts)
                 chat["bm25_encoder"] = bm25
-
                 chat["all_chunks_data"] = all_items
 
                 pc = Pinecone(api_key=PINECONE_API_KEY)
                 index_name = "graphrag"
 
                 if index_name not in [idx.name for idx in pc.list_indexes()]:
-                    pc.create_index(name=index_name, dimension=384, metric="dotproduct",
-                                     spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+                    pc.create_index(
+                        name=index_name, dimension=384, metric="dotproduct",
+                        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+                    )
                     wait_for_index_ready(pc, index_name, timeout=90)
                 else:
                     wait_for_index_ready(pc, index_name, timeout=30)
@@ -1323,7 +1441,9 @@ with st.sidebar:
                     dense = embeddings.embed_query(item["text"])
                     sparse = bm25.encode_documents([item["text"]])[0]
                     vectors.append({
-                        "id": f"chunk_{i}", "values": dense, "sparse_values": sparse,
+                        "id": f"chunk_{i}",
+                        "values": dense,
+                        "sparse_values": sparse,
                         "metadata": {
                             "context": item["text"],
                             "page": item["page"],
@@ -1334,16 +1454,23 @@ with st.sidebar:
                     })
 
                 for start_idx in range(0, len(vectors), 100):
-                    index.upsert(vectors=vectors[start_idx:start_idx + 100], namespace=chat["namespace"])
+                    index.upsert(
+                        vectors=vectors[start_idx:start_idx + 100],
+                        namespace=chat["namespace"]
+                    )
 
                 chat["pdf_processed"] = True
                 chat["doc_name"] = uploaded_file.name
                 if chat["name"].startswith("Chat "):
                     chat["name"] = uploaded_file.name[:30]
-                st.success(f"✅ Document processed! {len(all_items)} chunks indexed "
-                           f"({len(text_items)} text, {len(table_items)} table, {len(image_items)} image).")
+
+                st.success(
+                    f"✅ Document processed! {len(all_items)} chunks indexed "
+                    f"({len(text_items)} text, {len(table_items)} table, "
+                    f"{len(image_items)} image)."
+                )
                 if vision_errors_during_ingest:
-                    st.warning("Some vision descriptions failed during ingestion. See debug info for details.")
+                    st.warning("Some vision descriptions failed during ingestion.")
                     if st.session_state.show_debug:
                         for err in vision_errors_during_ingest[:3]:
                             st.code(err)
@@ -1366,20 +1493,32 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Neural RAG</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Deterministic · Multi-Hop Retrieval · Vision-Grounded Tables & Figures (Gemini) · Auto-Visualization</p>', unsafe_allow_html=True)
+st.markdown(
+    '<p class="sub-header">Deterministic · Multi-Hop Retrieval · '
+    'Vision-Grounded Tables & Figures (Gemini) · Auto-Visualization</p>',
+    unsafe_allow_html=True
+)
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
-st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
+st.subheader(
+    f"💬 {chat['name']}"
+    + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else "")
+)
 
 if not chat["pdf_processed"]:
-    st.info("👈 Upload a PDF for this chat in the sidebar, then click **Process Document** to start chatting.")
+    st.info(
+        "👈 Upload a PDF for this chat in the sidebar, "
+        "then click **Process Document** to start chatting."
+    )
     st.stop()
 
 for message in chat["chat_history"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-query = st.chat_input("Ask any question about your document (text, tables, or figures)...")
+query = st.chat_input(
+    "Ask any question about your document (text, tables, or figures)..."
+)
 
 if query:
     chat["chat_history"].append({"role": "user", "content": query})
@@ -1388,12 +1527,18 @@ if query:
 
     with st.chat_message("assistant"):
         if query.lower().strip() in ["hi", "hello", "hey"]:
-            resp = "Hello! 👋 Ask me anything about your document — including tables, figures, comparisons, or trends — and I'll give you a grounded, detailed answer (with vision analysis and charts when useful)."
+            resp = (
+                "Hello! 👋 Ask me anything about your document — including tables, "
+                "figures, comparisons, or trends — and I'll give you a grounded, "
+                "detailed answer (with vision analysis and charts when useful)."
+            )
             st.markdown(resp)
             chat["chat_history"].append({"role": "assistant", "content": resp})
         else:
             try:
-                with st.status("Thinking...", expanded=st.session_state.show_debug) as status:
+                with st.status(
+                    "Thinking...", expanded=st.session_state.show_debug
+                ) as status:
                     response, debug = run_rag_pipeline(
                         query, chat,
                         deterministic=st.session_state.deterministic_mode,
@@ -1404,12 +1549,14 @@ if query:
 
                 if debug.get("cache_hit"):
                     st.markdown(
-                        f"<span class='badge cache-hit'>⚡ CACHE HIT ({debug['similarity']:.2f})</span><br><br>",
+                        f"<span class='badge cache-hit'>⚡ CACHE HIT "
+                        f"({debug['similarity']:.2f})</span><br><br>",
                         unsafe_allow_html=True
                     )
                 if debug.get("vision_analyses"):
                     st.markdown(
-                        "<span class='badge vision-badge'>👁️ Vision model analyzed an image for this answer</span><br><br>",
+                        "<span class='badge vision-badge'>👁️ Vision model analyzed "
+                        "an image for this answer</span><br><br>",
                         unsafe_allow_html=True
                     )
 
@@ -1426,7 +1573,10 @@ if query:
                                 img_bytes = base64.b64decode(img_info["image_b64"])
                                 st.image(
                                     img_bytes,
-                                    caption=f"Page {img_info['page']} — {img_info.get('caption_text','')[:100]}",
+                                    caption=(
+                                        f"Page {img_info['page']} — "
+                                        f"{img_info.get('caption_text','')[:100]}"
+                                    ),
                                     use_container_width=True
                                 )
                             except Exception:
@@ -1438,7 +1588,10 @@ if query:
                         try:
                             chart_df = df.set_index(df.columns[0])
                             st.markdown("**📊 Visualization:**")
-                            if any(k in query.lower() for k in ["trend", "over time", "timeline"]):
+                            if any(
+                                k in query.lower()
+                                for k in ["trend", "over time", "timeline"]
+                            ):
                                 st.line_chart(chart_df)
                             else:
                                 st.bar_chart(chart_df)
@@ -1447,37 +1600,42 @@ if query:
 
                 if debug.get("trace_url"):
                     st.markdown(
-                        f"<span class='badge trace-badge'>🔗 <a href='{debug['trace_url']}' target='_blank'>View trace in LangSmith</a></span>",
+                        f"<span class='badge trace-badge'>🔗 "
+                        f"<a href='{debug['trace_url']}' target='_blank'>"
+                        f"View trace in LangSmith</a></span>",
                         unsafe_allow_html=True
                     )
 
                 if st.session_state.show_debug and not debug.get("cache_hit"):
-                    with st.expander("🔍 Debug: Retrieval & Context (For QA / Portfolio)"):
+                    with st.expander("🔍 Debug: Retrieval & Context"):
                         st.markdown("**Sub-queries used for multi-hop retrieval:**")
                         for sq in debug.get("sub_queries", []):
                             st.write(f"- {sq}")
-                        st.markdown("**Retrieved chunks (page / chunk index / type / preview):**")
+                        st.markdown("**Retrieved chunks:**")
                         st.json(debug.get("retrieved_pages", []))
                         if debug.get("keyword_boosted"):
-                            st.markdown("**Force-included via keyword boost (explicit Figure/Table N reference):**")
+                            st.markdown("**Force-included via keyword boost:**")
                             st.json(debug.get("keyword_boosted", []))
                         if debug.get("image_boosted"):
-                            st.markdown("**Force-included image chunks (visual query detected):**")
+                            st.markdown("**Force-included image chunks:**")
                             st.json(debug.get("image_boosted", []))
                         if debug.get("vision_analyses"):
-                            st.markdown("**🖼️ Live vision model analysis performed for this question:**")
+                            st.markdown("**🖼️ Live vision model analysis:**")
                             for va in debug["vision_analyses"]:
                                 st.text(va)
                         if debug.get("vision_errors"):
-                            st.markdown("**⚠️ Vision errors encountered:**")
+                            st.markdown("**⚠️ Vision errors:**")
                             for err in debug["vision_errors"]:
                                 st.error(err)
-                        st.markdown("**Compression scores (score, sentence preview):**")
+                        st.markdown("**Compression scores:**")
                         st.json(debug.get("compression_scores", []))
                         st.markdown("**Compressed context sent to the LLM:**")
                         st.write(debug.get("compressed_text", ""))
                         if debug.get("trace_url"):
-                            st.markdown(f"**LangSmith trace:** [{debug['trace_url']}]({debug['trace_url']})")
+                            st.markdown(
+                                f"**LangSmith trace:** "
+                                f"[{debug['trace_url']}]({debug['trace_url']})"
+                            )
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
@@ -1486,13 +1644,20 @@ if query:
 st.divider()
 with st.expander("🧪 Evaluation Harness — Consistency Testing"):
     st.caption(
-        "Run the same questions multiple times to verify determinism and detect drift. "
-        "Every run is also traced to LangSmith (if enabled) under `deterministic`/`sampled` tags."
+        "Run the same questions multiple times to verify determinism and detect drift."
     )
-    default_qs = "What is the main topic of this document?\nHow does the first major concept connect to the last one discussed?"
-    test_qs_raw = st.text_area("Test questions (one per line)", value=default_qs, height=120,
-                                key=f"eval_qs_{st.session_state.current_chat_id}")
-    runs_per_q = st.slider("Runs per question", 2, 5, 3, key=f"eval_runs_{st.session_state.current_chat_id}")
+    default_qs = (
+        "What is the main topic of this document?\n"
+        "How does the first major concept connect to the last one discussed?"
+    )
+    test_qs_raw = st.text_area(
+        "Test questions (one per line)", value=default_qs, height=120,
+        key=f"eval_qs_{st.session_state.current_chat_id}"
+    )
+    runs_per_q = st.slider(
+        "Runs per question", 2, 5, 3,
+        key=f"eval_runs_{st.session_state.current_chat_id}"
+    )
 
     if st.button("▶️ Run Evaluation", key=f"run_eval_{st.session_state.current_chat_id}"):
         questions = [q.strip() for q in test_qs_raw.splitlines() if q.strip()]
@@ -1505,7 +1670,9 @@ with st.expander("🧪 Evaluation Harness — Consistency Testing"):
             responses = []
             trace_urls = []
             for _ in range(runs_per_q):
-                resp, dbg = run_rag_pipeline(q, chat, deterministic=True, use_cache=False, status=None)
+                resp, dbg = run_rag_pipeline(
+                    q, chat, deterministic=True, use_cache=False, status=None
+                )
                 responses.append(resp)
                 trace_urls.append(dbg.get("trace_url"))
                 step += 1
@@ -1515,7 +1682,9 @@ with st.expander("🧪 Evaluation Harness — Consistency Testing"):
             results.append({
                 "Question": q,
                 "Consistency Score (0-1)": round(consistency, 3),
-                "Sample Answer": responses[0][:200] + ("..." if len(responses[0]) > 200 else ""),
+                "Sample Answer": (
+                    responses[0][:200] + ("..." if len(responses[0]) > 200 else "")
+                ),
                 "Trace (Run 1)": trace_urls[0] if trace_urls else None,
             })
 
@@ -1526,6 +1695,5 @@ with st.expander("🧪 Evaluation Harness — Consistency Testing"):
         st.dataframe(st.session_state[results_key], use_container_width=True)
         st.caption(
             "Consistency Score ≥ 0.9 typically means near-identical answers across runs. "
-            "Anything below ~0.7 indicates the pipeline is still non-deterministic for that question type. "
-            "Click a trace link to inspect the exact retrieval/context/prompt for that specific run in LangSmith."
+            "Anything below ~0.7 indicates non-determinism for that question type."
         )
