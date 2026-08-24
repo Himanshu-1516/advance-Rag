@@ -78,7 +78,7 @@ GEMINI_API_KEY = gemini_api_key
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "")
 
 # Main text model
-GEMINI_MODEL = os.getenv("GEMINI_MODEL") or st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or st.secrets.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Vision models in fallback order — gemini-2.5-flash is the new release
 DEFAULT_VISION_MODELS = [
