@@ -19,7 +19,7 @@ except Exception:
     pass
 
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -72,14 +72,20 @@ except Exception:
         return None
 
 # ========================= API KEYS =========================
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "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")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
-GROQ_MODEL = os.getenv("GROQ_MODEL") or st.secrets.get("GROQ_MODEL", "groq/compound")
+gemini_api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "AIzaSyBbhIG-nBJMuazib7Yr5H-pHxD40drLCmY")
+GEMINI_API_KEY = gemini_api_key
 
-# Vision-capable Groq models (fallback list)
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY", "pcsk_39EGLB_PC9i9y7MQo2FxSqgqdX4akFP3LPFoNqHirwHsicYqAivgQASB4bFsM9ocPY9epZ")
+
+# Main text model (Gemini free-tier model)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+# Gemini is natively multimodal — the same models handle vision.
+# Listed in fallback order (tried in sequence if one fails/rate-limits).
 DEFAULT_VISION_MODELS = [
-    "llama-3.2-11b-vision-preview",
-    "llama-3.2-90b-vision-preview",
+    "gemini-1.5-flash",
+    "gemini-2.0-flash-exp",
+    "gemini-1.5-pro",
 ]
 
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY") or st.secrets.get("LANGSMITH_API_KEY", "")
@@ -87,7 +93,7 @@ LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT") or st.secrets.get("LANGSMITH_
 LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT") or st.secrets.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 
 KEYS_CONFIGURED = (
-    GROQ_API_KEY and "PASTE_YOUR" not in GROQ_API_KEY and
+    GEMINI_API_KEY and "PASTE_YOUR" not in GEMINI_API_KEY and
     PINECONE_API_KEY and "PASTE_YOUR" not in PINECONE_API_KEY
 )
 
@@ -97,7 +103,7 @@ LANGSMITH_CONFIGURED = bool(
     LANGSMITH_SDK_AVAILABLE and LANGSMITH_API_KEY and "PASTE_YOUR" not in LANGSMITH_API_KEY
 )
 
-# ========================= PAGE CONFIG & CUSTOM CSS =========================
+# ========================= PAGE CONFIG & CUSTOM CSS (THEME-SAFE) =========================
 st.set_page_config(page_title="Neural RAG", page_icon="🧠", layout="wide")
 
 st.markdown("""
@@ -107,61 +113,70 @@ st.markdown("""
     footer {visibility: hidden;}
     header {visibility: hidden;}
 
-    /* Global font & background */
+    /* Global font */
     html, body, [class*="css"] {
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
+
+    /* Use Streamlit's own theme variables so it works in BOTH light & dark mode */
     .stApp {
-        background: linear-gradient(160deg, #f8fafc 0%, #e2e8f0 100%);
+        background: var(--background-color, #ffffff);
+        color: var(--text-color, #0f172a);
     }
 
-    /* Main header */
+    /* Main header — gradient text works fine on any theme */
     .main-header {
         font-size: 2.8rem;
         font-weight: 800;
-        background: linear-gradient(90deg, #4f46e5, #7c3aed);
+        background: linear-gradient(90deg, #6366f1, #a855f7);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
         margin-bottom: 0.25rem;
     }
     .sub-header {
         font-size: 1.05rem;
-        color: #475569;
+        color: var(--text-color, #475569);
+        opacity: 0.75;
         margin-bottom: 1.5rem;
     }
 
-    /* Chat message styling */
+    /* Chat message styling — adapts to theme via secondary-background-color */
     div[data-testid="stChatMessage"] {
-        background-color: #ffffff;
+        background-color: var(--secondary-background-color, #f1f5f9);
+        color: var(--text-color, #0f172a);
         border-radius: 16px;
         padding: 16px 20px;
         margin-bottom: 12px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-        border: 1px solid #e2e8f0;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        border: 1px solid rgba(128,128,128,0.25);
     }
-    /* Differentiate user vs assistant bubbles subtly */
-    div[data-testid="stChatMessage"]:has(.stChatMessageAvatarUser) {
-        background-color: #f0f4ff;
-        border-color: #c7d2fe;
+    div[data-testid="stChatMessage"] p,
+    div[data-testid="stChatMessage"] li,
+    div[data-testid="stChatMessage"] span {
+        color: var(--text-color, #0f172a) !important;
     }
 
-    /* Badges */
+    /* Badges — fixed light backgrounds w/ dark text so they stay readable on any theme */
     .badge {
         display: inline-block;
         padding: 4px 12px;
         border-radius: 20px;
         font-size: 0.8rem;
-        font-weight: 600;
+        font-weight: 700;
         margin-right: 8px;
     }
-    .cache-hit { background-color: #dcfce7; color: #166534; }
-    .vision-badge { background-color: #fef3c7; color: #92400e; }
-    .trace-badge { background-color: #e0e7ff; color: #3730a3; }
+    .cache-hit { background-color: #bbf7d0; color: #14532d; }
+    .vision-badge { background-color: #fde68a; color: #78350f; }
+    .trace-badge { background-color: #c7d2fe; color: #312e81; }
+    .trace-badge a { color: #312e81 !important; font-weight: 700; }
 
-    /* Sidebar */
+    /* Sidebar — adapts to theme */
     section[data-testid="stSidebar"] {
-        background-color: #ffffff;
-        border-right: 1px solid #e2e8f0;
+        background-color: var(--secondary-background-color, #f8fafc);
+        border-right: 1px solid rgba(128,128,128,0.2);
+    }
+    section[data-testid="stSidebar"] * {
+        color: var(--text-color, #0f172a);
     }
     section[data-testid="stSidebar"] > div {
         padding-top: 1.5rem;
@@ -175,25 +190,32 @@ st.markdown("""
     }
     .stButton > button:hover {
         transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.2);
     }
 
     /* Expander */
     .streamlit-expanderHeader {
         font-weight: 600;
-        color: #334155;
+        color: var(--text-color, #334155) !important;
     }
 
     /* Chat input */
     [data-testid="stChatInput"] textarea {
         border-radius: 12px;
-        border: 1px solid #cbd5e1;
+        border: 1px solid rgba(128,128,128,0.4);
+        background-color: var(--background-color, #ffffff);
+        color: var(--text-color, #0f172a);
+    }
+
+    /* Make sure markdown / json / code blocks stay legible on dark theme */
+    .stMarkdown, .stJson, .stCode, .stText {
+        color: var(--text-color, inherit);
     }
 </style>
 """, unsafe_allow_html=True)
 
 if not KEYS_CONFIGURED:
-    st.error("⚠️ API keys are not configured yet. Please set `GROQ_API_KEY` and `PINECONE_API_KEY` in the script.")
+    st.error("⚠️ API keys are not configured yet. Please set `GEMINI_API_KEY` and `PINECONE_API_KEY` in the script.")
     st.stop()
 
 # ========================= LANGSMITH SETUP =========================
@@ -244,25 +266,25 @@ def load_reranker():
 embeddings = load_embeddings()
 reranker = load_reranker()
 
-# ========================= LLM FACTORIES =========================
+# ========================= LLM FACTORIES (GEMINI) =========================
 def get_llm(deterministic=True):
-    return ChatGroq(
-        model=GROQ_MODEL,
-        api_key=GROQ_API_KEY,
+    return ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        google_api_key=GEMINI_API_KEY,
         temperature=0.0 if deterministic else 0.7,
     )
 
 def get_vision_llm(model_name):
-    """Return a ChatGroq instance for a specific vision model."""
-    return ChatGroq(
+    """Return a ChatGoogleGenerativeAI instance for a specific Gemini model (natively multimodal)."""
+    return ChatGoogleGenerativeAI(
         model=model_name,
-        api_key=GROQ_API_KEY,
+        google_api_key=GEMINI_API_KEY,
         temperature=0.0,
     )
 
 # ========================= VISION HELPER: TRY MULTIPLE MODELS =========================
 def try_vision_call(prompt_text, image_b64, image_ext, model_list):
-    """Try a list of vision models in order. Returns (result, error_message)."""
+    """Try a list of Gemini vision-capable models in order. Returns (result, error_message)."""
     errors = []
     for model in model_list:
         try:
@@ -320,7 +342,7 @@ def encode_image_b64(image_bytes):
 
 # ========================= VISION MODEL CALLS (with fallback) =========================
 def describe_image_generic(image_b64, image_ext, page, caption_hint="", model_list=None):
-    """INGESTION-TIME: Describe image using fallback vision models."""
+    """INGESTION-TIME: Describe image using fallback Gemini vision models."""
     if model_list is None:
         model_list = st.session_state.get("vision_model_list", DEFAULT_VISION_MODELS)
     prompt_text = f"""Describe this image from page {page} of a document in full, factual
@@ -334,7 +356,7 @@ so briefly instead of inventing data.
     return try_vision_call(prompt_text, image_b64, image_ext, model_list)
 
 def analyze_image_for_question(image_b64, image_ext, page, user_question, caption_hint="", model_list=None):
-    """QUERY-TIME: Re-examine image with the user's specific question, using fallback models."""
+    """QUERY-TIME: Re-examine image with the user's specific question, using fallback Gemini models."""
     if model_list is None:
         model_list = st.session_state.get("vision_model_list", DEFAULT_VISION_MODELS)
     prompt_text = f"""You are looking directly at an image extracted from page {page} of a
@@ -1136,24 +1158,24 @@ with st.sidebar:
         st.success("Cache cleared for this chat.")
 
     st.divider()
-    st.markdown("<h2>🖼️ Vision Model</h2>", unsafe_allow_html=True)
+    st.markdown("<h2>🖼️ Vision Model (Gemini)</h2>", unsafe_allow_html=True)
     if PYMUPDF_AVAILABLE and VISION_CONFIGURED:
-        st.success("✅ Vision pipeline available")
+        st.success("✅ Vision pipeline available (Gemini multimodal)")
     elif not PYMUPDF_AVAILABLE:
         st.warning("Install `pymupdf` to enable image extraction: `pip install pymupdf`")
     else:
-        st.warning("Vision requires a configured GROQ_API_KEY.")
+        st.warning("Vision requires a configured GEMINI_API_KEY.")
 
     st.session_state.enable_vision = st.checkbox(
         "Enable vision-based image understanding",
         value=st.session_state.enable_vision,
-        help="Uses a multimodal Groq model to actually look at extracted images/figures."
+        help="Uses Gemini's native multimodal capability to actually look at extracted images/figures."
     )
     with st.expander("Advanced vision settings"):
         # Let user edit the model list (one per line)
         current_models = "\n".join(st.session_state.vision_model_list)
         new_models = st.text_area(
-            "Vision model names (one per line, tried in order)",
+            "Gemini model names (one per line, tried in order)",
             value=current_models,
             height=100,
             key="vision_model_list_editor"
@@ -1344,7 +1366,7 @@ with st.sidebar:
 
 # ========================= MAIN UI =========================
 st.markdown('<p class="main-header">🧠 Neural RAG</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Deterministic · Multi-Hop Retrieval · Vision-Grounded Tables & Figures · Auto-Visualization</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Deterministic · Multi-Hop Retrieval · Vision-Grounded Tables & Figures (Gemini) · Auto-Visualization</p>', unsafe_allow_html=True)
 
 chat = st.session_state.chats[st.session_state.current_chat_id]
 st.subheader(f"💬 {chat['name']}" + (f"  ·  📄 {chat['doc_name']}" if chat["doc_name"] else ""))
@@ -1425,7 +1447,7 @@ if query:
 
                 if debug.get("trace_url"):
                     st.markdown(
-                        f"<span class='badge trace-badge'>🔗 <a href='{debug['trace_url']}' target='_blank' style='color:white;'>View trace in LangSmith</a></span>",
+                        f"<span class='badge trace-badge'>🔗 <a href='{debug['trace_url']}' target='_blank'>View trace in LangSmith</a></span>",
                         unsafe_allow_html=True
                     )
 
